@@ -372,12 +372,13 @@ pub async fn start_with(
             pb::session_message::Open {},
         )),
     }))?;
-    let inbound = pb::session_client::SessionClient::new(channel)
-        .open(UnboundedReceiverStream::new(outbound))
-        .await?
-        .into_inner();
-
-    tokio::spawn(receive(shared.clone(), inbound));
+    // The stream is opened where nothing waits on it: a Core may send nothing, not even the start of its
+    // answer, until it has something to say, and the heartbeat must not wait for that.
+    tokio::spawn(receive(
+        shared.clone(),
+        pb::session_client::SessionClient::new(channel),
+        outbound,
+    ));
     let interval = response
         .heartbeat
         .and_then(|h| h.interval)
@@ -427,8 +428,23 @@ async fn beat(shared: Arc<Shared>, interval: Duration) {
     }
 }
 
-/// Surfaces what the Session brings, until it ends.
-async fn receive(shared: Arc<Shared>, mut inbound: tonic::Streaming<pb::Envelope>) {
+/// Opens the Session's stream, and surfaces what it brings until it ends.
+async fn receive(
+    shared: Arc<Shared>,
+    mut client: pb::session_client::SessionClient<tonic::transport::Channel>,
+    outbound: mpsc::UnboundedReceiver<pb::Envelope>,
+) {
+    let mut inbound = match client.open(UnboundedReceiverStream::new(outbound)).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            shared.finish(Ended {
+                closed: false,
+                cause: Some("liveness lost".into()),
+                line: format!("the Session's stream could not be opened: {status}"),
+            });
+            return;
+        }
+    };
     loop {
         let e = match inbound.message().await {
             Ok(Some(e)) => e,
