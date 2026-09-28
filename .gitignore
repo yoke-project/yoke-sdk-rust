@@ -1,2 +1,3 @@
-# What a run writes, and nothing else (yoke-project/yoke#35).
+# What a run writes, and what a build writes, and nothing else (yoke-project/yoke#35).
 .results/
+/target
