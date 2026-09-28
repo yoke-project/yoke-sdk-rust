@@ -305,7 +305,7 @@ impl Shared {
 /// A started unit and its Session.
 pub struct Unit {
     admission: Admission,
-    events: mpsc::UnboundedReceiver<Event>,
+    events: tokio::sync::Mutex<mpsc::UnboundedReceiver<Event>>,
     shared: Arc<Shared>,
     _socket: UnixListener,
 }
@@ -391,7 +391,7 @@ pub async fn start_with(
             granted: response.granted.into(),
             withheld: response.withheld.into(),
         },
-        events,
+        events: tokio::sync::Mutex::new(events),
         shared,
         _socket: socket,
     })
@@ -515,8 +515,8 @@ impl Unit {
 
     /// The next thing the Session brings, in order; `None` once the end has been surfaced. The
     /// incarnation is then over, and the process should finish.
-    pub async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
+    pub async fn next(&self) -> Option<Event> {
+        self.events.lock().await.recv().await
     }
 
     /// Ends the Session in order: a CLOSE, the unit's own departure.
