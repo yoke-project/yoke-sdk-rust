@@ -3,7 +3,7 @@
 
 # Build this repository's codebase.
 build:
-    @echo "build: nothing to build in yoke-sdk-rust yet"
+    cargo build --workspace --all-targets --locked
 
 # Run this repository's own checks, with no sibling present.
 test:
@@ -21,6 +21,8 @@ test:
         status=1
     fi
     bash checks/run.sh | tee .results/checks.txt || status=1
+    cargo test --workspace --locked --no-fail-fast 2>&1 | tee .results/cargo.txt; (( PIPESTATUS[0] == 0 )) || status=1
+    bash ci/cargo-results.sh .results/cargo.txt > .results/cargo.json
     date -u +%Y-%m-%dT%H:%M:%SZ > .results/finished
     exit "$status"
 
@@ -36,9 +38,7 @@ lint:
 fmt:
     #!/usr/bin/env bash
     set -euo pipefail
-    files="$(find . -name '*.rs' -not -path './.git/*' | sort)"
-    if [[ -z "$files" ]]; then echo "fmt: nothing to format yet"; exit 0; fi
-    rustfmt --check --edition 2024 $files
+    cargo fmt --all --check
     echo "fmt: every file is formatted"
 
 # Verify the toolchain against the floor the workspace's fan-out passes, and put the verification

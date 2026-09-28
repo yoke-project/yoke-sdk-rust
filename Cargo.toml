@@ -1,0 +1,22 @@
+# The Rust family: a base and the libraries over it. Nothing is published before 0.3, which names the
+# packages; until then the crates are source only.
+[workspace]
+members = ["base", "plugin"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+yoke-proto = "=0.1.0"
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }

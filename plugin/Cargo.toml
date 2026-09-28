@@ -1,0 +1,20 @@
+[package]
+name = "yoke-plugin"
+description = "The library a Yoke Plugin unit is written with"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+yoke-base = { path = "../base" }
+yoke-proto.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tonic = { workspace = true, features = ["router", "server"] }
+prost-types.workspace = true
