@@ -369,8 +369,18 @@ fn the_suite_is_the_published_pair_authenticated_and_never_built() {
         script.contains("manifest.jsonl") && script.contains("sha256sum"),
         "the script does not authenticate it by the manifest"
     );
-    for build in ["go install", "go build", "go run", "cargo install"] {
-        assert!(!script.contains(build), "the script builds with {build}");
+    // Commands are read as words, so that `cargo build` of the harness is not taken for `go build`.
+    let words: Vec<&str> = script.split_whitespace().collect();
+    for pair in words.windows(2) {
+        assert!(
+            !matches!(
+                (pair[0], pair[1]),
+                ("go", "install" | "build" | "run") | ("cargo", "install")
+            ),
+            "the script builds with {} {}",
+            pair[0],
+            pair[1]
+        );
     }
     let workflow = std::fs::read_to_string(root.join(".github/workflows/verify.yml")).unwrap();
     let (test, conformance) = (
