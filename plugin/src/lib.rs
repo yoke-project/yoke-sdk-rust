@@ -1,14 +1,33 @@
 //! The library a Plugin unit is written with.
+//!
+//! One declaration is both the Manifest the library generates and the surface its registration claims,
+//! so the two cannot be written apart. Starting a unit performs the first acts in their order: read the
+//! environment, bind the unit's own socket, register, open the Session — and then beats on the terms the
+//! Core assigned. Everything the Session brings is surfaced, its end included: a Session that ends ends
+//! the incarnation, and the library never reconnects, never retries an admission, never polls, never
+//! creates a stream's transport and never chooses a severity.
 
-use yoke_base::Error;
+use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+
+use pb::envelope::Payload;
+use yoke_base::{Envelopes, Error, PLUGIN_CONTRACT, Refusal, dial, environment, refusal_of};
+use yoke_proto::plugin::v1 as pb;
 
 /// What this library says it is, at admission.
 pub const SDK_LINE: &str = "yoke-sdk-rust 0.0.0";
 
-/// What a Plugin says about itself.
+/// What a Plugin says about itself: what is true of the binary wherever it runs.
 #[derive(Debug, Clone, Default)]
 pub struct Declaration {
     pub id: String,
+    /// `<class>` or `<class>:<name>`.
     pub needs: Vec<String>,
     pub streams: Vec<Stream>,
     pub commands: Vec<String>,
@@ -45,7 +64,89 @@ pub enum Object {
 impl Declaration {
     /// The document the declaration generates.
     pub fn manifest(&self) -> String {
-        String::new()
+        let mut m = String::new();
+        let _ = writeln!(
+            m,
+            "manifest: 1\nid: {}\nprotocol: {}",
+            scalar(&self.id),
+            PLUGIN_CONTRACT
+        );
+        if !self.needs.is_empty() {
+            m.push_str("needs:\n");
+            for need in &self.needs {
+                let _ = writeln!(m, "  - {}", scalar(need));
+            }
+        }
+        if !self.streams.is_empty() {
+            m.push_str("streams:\n");
+            for s in &self.streams {
+                let _ = writeln!(m, "  - id: {}", scalar(&s.id));
+                if s.tolerates_loss {
+                    m.push_str("    tolerates_loss: true\n");
+                }
+                if s.tolerates_reorder {
+                    m.push_str("    tolerates_reorder: true\n");
+                }
+            }
+        }
+        for (key, list) in [
+            ("commands", &self.commands),
+            ("queries", &self.queries),
+            ("occurrences", &self.occurrences),
+        ] {
+            if !list.is_empty() {
+                let _ = writeln!(m, "{key}:");
+                for id in list {
+                    let _ = writeln!(m, "  - id: {}", scalar(id));
+                }
+            }
+        }
+        if !self.capabilities.is_empty() {
+            m.push_str("capabilities:\n");
+            for c in &self.capabilities {
+                let (kind, id) = match &c.governs {
+                    Object::Stream(id) => ("stream", id),
+                    Object::Command(id) => ("command", id),
+                    Object::Query(id) => ("query", id),
+                    Object::Occurrence(id) => ("occurrence", id),
+                    Object::Surface(id) => ("surface", id),
+                };
+                let _ = writeln!(
+                    m,
+                    "  - name: {}\n    governs:\n      {kind}: {}",
+                    scalar(&c.name),
+                    scalar(id)
+                );
+            }
+        }
+        m
+    }
+
+    /// What the registration claims: the declaration again, from the same value.
+    fn surface(&self) -> pb::Surface {
+        pb::Surface {
+            capabilities: self.capabilities.iter().map(|c| c.name.clone()).collect(),
+            streams: self.streams.iter().map(|s| s.id.clone()).collect(),
+            commands: self.commands.clone(),
+            queries: self.queries.clone(),
+        }
+    }
+}
+
+/// A value as YAML writes it: plain where it is an identifier, quoted otherwise.
+fn scalar(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if plain {
+        value.to_string()
+    } else {
+        format!("{value:?}")
     }
 }
 
@@ -58,15 +159,28 @@ pub struct Scope {
     pub queries: Vec<String>,
 }
 
+impl From<Option<pb::Surface>> for Scope {
+    fn from(s: Option<pb::Surface>) -> Self {
+        let s = s.unwrap_or_default();
+        Scope {
+            capabilities: s.capabilities,
+            streams: s.streams,
+            commands: s.commands,
+            queries: s.queries,
+        }
+    }
+}
+
 /// What the Core answered.
 #[derive(Debug, Clone, Default)]
 pub struct Admission {
     pub restricted: bool,
     pub granted: Scope,
+    /// Item by item.
     pub withheld: Scope,
 }
 
-/// An instruction the Core sent.
+/// An instruction the Core sent, to be acknowledged.
 #[derive(Debug, Clone)]
 pub struct Command {
     pub id: String,
@@ -74,7 +188,7 @@ pub struct Command {
     pub payload: Vec<u8>,
 }
 
-/// A question the Core asked.
+/// A question the Core asked, to be answered.
 #[derive(Debug, Clone)]
 pub struct Question {
     pub id: String,
@@ -82,19 +196,37 @@ pub struct Question {
     pub payload: Vec<u8>,
 }
 
-/// The end of the Session.
+/// A stream the unit may now emit on, and where.
+#[derive(Debug, Clone)]
+pub struct Activated {
+    pub stream: String,
+    pub transport: String,
+    pub address: String,
+}
+
+/// The end of the Session: closed by this unit, or revoked by the Core. Nothing follows it.
 #[derive(Debug, Clone)]
 pub struct Ended {
     pub closed: bool,
+    /// For a revocation: liveness lost, plugin disabled, scope exceeded, protocol failure.
     pub cause: Option<String>,
     pub line: String,
 }
 
-/// What the Session brings.
+/// What the Session brings, in the order it arrived; the last is an `Ended`.
 #[derive(Debug)]
 pub enum Event {
     Command(Command),
     Question(Question),
+    Activated(Activated),
+    Stopped {
+        stream: String,
+    },
+    /// An error the Core answered a message with.
+    Refused {
+        correlation: String,
+        error: Error,
+    },
     Ended(Ended),
 }
 
@@ -106,49 +238,76 @@ pub enum Outcome {
     Failed,
 }
 
-/// How serious an occurrence is.
+/// How routine or alarming an occurrence is, from 0 to 99: the author's statement and nobody else's.
 #[derive(Debug, Clone, Copy)]
 pub struct Severity(u8);
 
 impl Severity {
+    /// A severity the author states.
     pub fn of(n: u8) -> Self {
         Severity(n)
+    }
+}
+
+/// What the Session's two tasks and the author's calls share.
+struct Shared {
+    envelopes: Envelopes,
+    state: Mutex<State>,
+}
+
+struct State {
+    out: Option<mpsc::UnboundedSender<pb::Envelope>>,
+    events: Option<mpsc::UnboundedSender<Event>>,
+    ended: bool,
+    closing: bool,
+    active: HashSet<String>,
+}
+
+impl Shared {
+    fn send(&self, payload: Payload) -> Result<(), Error> {
+        self.deliver(self.envelopes.seal(payload))
+    }
+
+    fn answer(&self, to: &str, payload: Payload) -> Result<(), Error> {
+        self.deliver(self.envelopes.answer(to, payload))
+    }
+
+    fn deliver(&self, e: pb::Envelope) -> Result<(), Error> {
+        let state = self.state.lock().unwrap();
+        match (&state.out, state.ended) {
+            (Some(out), false) => out
+                .send(e)
+                .map_err(|_| Error::refusal("session.revoked", "the Session has ended")),
+            _ => Err(Error::refusal("session.revoked", "the Session has ended")),
+        }
+    }
+
+    fn surface(&self, event: Event) {
+        if let Some(events) = &self.state.lock().unwrap().events {
+            let _ = events.send(event);
+        }
+    }
+
+    /// Ends the Session once: the end is surfaced, nothing follows it, and nothing more is sent.
+    fn finish(&self, end: Ended) {
+        let mut state = self.state.lock().unwrap();
+        if state.ended {
+            return;
+        }
+        state.ended = true;
+        state.out = None;
+        if let Some(events) = state.events.take() {
+            let _ = events.send(Event::Ended(end));
+        }
     }
 }
 
 /// A started unit and its Session.
 pub struct Unit {
     admission: Admission,
-}
-
-impl Unit {
-    pub fn admission(&self) -> &Admission {
-        &self.admission
-    }
-    pub async fn next(&mut self) -> Option<Event> {
-        None
-    }
-    pub async fn close(&self) -> Result<(), Error> {
-        Ok(())
-    }
-    pub async fn ack(&self, _c: &Command, _o: Outcome, _line: &str) -> Result<(), Error> {
-        Ok(())
-    }
-    pub async fn answer(&self, _q: &Question, _payload: Vec<u8>) -> Result<(), Error> {
-        Ok(())
-    }
-    pub async fn report(
-        &self,
-        _occurrence: &str,
-        _s: Option<Severity>,
-        _line: &str,
-        _detail: Vec<u8>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-    pub async fn emit(&self, _stream: &str, _payload: Vec<u8>) -> Result<(), Error> {
-        Ok(())
-    }
+    events: mpsc::UnboundedReceiver<Event>,
+    shared: Arc<Shared>,
+    _socket: UnixListener,
 }
 
 /// Starts a unit from its environment.
@@ -156,10 +315,318 @@ pub async fn start(d: &Declaration) -> Result<Unit, Error> {
     start_with(d, |k| std::env::var(k).ok()).await
 }
 
-/// Starts a unit from the environment getenv reads.
+/// Starts a unit from the environment `getenv` reads: bind, register, open the Session. A refusal is
+/// returned with its stage and code, and nothing is tried again.
 pub async fn start_with(
-    _d: &Declaration,
-    _getenv: impl Fn(&str) -> Option<String>,
+    d: &Declaration,
+    getenv: impl Fn(&str) -> Option<String>,
 ) -> Result<Unit, Error> {
-    Err(Error::Transport("not yet".into()))
+    let env = environment(getenv)?;
+    // Bind before registering: registered and unreachable is the one order that is wrong.
+    let _ = std::fs::remove_file(&env.bind);
+    let socket = UnixListener::bind(&env.bind).map_err(|e| {
+        Error::Transport(format!(
+            "the unit's socket {} cannot be bound: {e}",
+            env.bind.display()
+        ))
+    })?;
+    let channel = dial(&env.socket).await?;
+    let response = pb::register_client::RegisterClient::new(channel.clone())
+        .register(pb::RegisterRequest {
+            plugin: env.plugin,
+            unit: env.unit,
+            token: env.token,
+            protocol: PLUGIN_CONTRACT,
+            language: "rust".into(),
+            sdk_line: SDK_LINE.into(),
+            declared: Some(d.surface()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let outcome = pb::register_response::Outcome::try_from(response.outcome)
+        .unwrap_or(pb::register_response::Outcome::Unspecified);
+    if outcome == pb::register_response::Outcome::Refused {
+        return Err(Error::Refusal(Refusal {
+            code: response.code,
+            message: response.message,
+            stage: Some(stage_name(response.stage)),
+        }));
+    }
+
+    let (out, outbound) = mpsc::unbounded_channel();
+    let (events_tx, events) = mpsc::unbounded_channel();
+    let shared = Arc::new(Shared {
+        envelopes: Envelopes::new(&response.session_id),
+        state: Mutex::new(State {
+            out: Some(out),
+            events: Some(events_tx),
+            ended: false,
+            closing: false,
+            active: HashSet::new(),
+        }),
+    });
+    // The first envelope is the OPEN, carrying the identity admission issued.
+    shared.send(Payload::Session(pb::SessionMessage {
+        kind: Some(pb::session_message::Kind::Open(
+            pb::session_message::Open {},
+        )),
+    }))?;
+    let inbound = pb::session_client::SessionClient::new(channel)
+        .open(UnboundedReceiverStream::new(outbound))
+        .await?
+        .into_inner();
+
+    tokio::spawn(receive(shared.clone(), inbound));
+    let interval = response
+        .heartbeat
+        .and_then(|h| h.interval)
+        .map(|d| Duration::new(d.seconds.max(0) as u64, d.nanos.max(0) as u32));
+    if let Some(interval) = interval.filter(|d| !d.is_zero()) {
+        tokio::spawn(beat(shared.clone(), interval));
+    }
+    Ok(Unit {
+        admission: Admission {
+            restricted: outcome == pb::register_response::Outcome::AcceptedWithRestrictions,
+            granted: response.granted.into(),
+            withheld: response.withheld.into(),
+        },
+        events,
+        shared,
+        _socket: socket,
+    })
+}
+
+fn stage_name(stage: i32) -> String {
+    pb::Stage::try_from(stage)
+        .map(|s| words(s.as_str_name(), "STAGE_"))
+        .unwrap_or_default()
+}
+
+/// An enumerator's name as a person reads it: `CAUSE_PLUGIN_DISABLED` is `plugin disabled`.
+fn words(name: &str, prefix: &str) -> String {
+    name.trim_start_matches(prefix)
+        .to_lowercase()
+        .replace('_', " ")
+}
+
+/// Sends a heartbeat at the interval the Core assigned, until the Session ends.
+async fn beat(shared: Arc<Shared>, interval: Duration) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    loop {
+        ticker.tick().await;
+        if shared
+            .send(Payload::Health(pb::Health {
+                grade: 99,
+                line: String::new(),
+            }))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Surfaces what the Session brings, until it ends.
+async fn receive(shared: Arc<Shared>, mut inbound: tonic::Streaming<pb::Envelope>) {
+    loop {
+        let e = match inbound.message().await {
+            Ok(Some(e)) => e,
+            ended => {
+                let closing = shared.state.lock().unwrap().closing;
+                let end = if closing {
+                    Ended {
+                        closed: true,
+                        cause: None,
+                        line: String::new(),
+                    }
+                } else {
+                    let why = match ended {
+                        Err(status) => status.to_string(),
+                        _ => "the stream ended".into(),
+                    };
+                    Ended {
+                        closed: false,
+                        cause: Some("liveness lost".into()),
+                        line: format!("the Session's stream ended: {why}"),
+                    }
+                };
+                shared.finish(end);
+                return;
+            }
+        };
+        match e.payload {
+            Some(Payload::Session(pb::SessionMessage {
+                kind: Some(pb::session_message::Kind::Revoked(r)),
+            })) => {
+                let cause = pb::session_message::revoked::Cause::try_from(r.cause)
+                    .map(|c| words(c.as_str_name(), "CAUSE_"))
+                    .unwrap_or_default();
+                shared.finish(Ended {
+                    closed: false,
+                    cause: Some(cause),
+                    line: r.line,
+                });
+                return;
+            }
+            Some(Payload::Control(pb::Control { kind: Some(kind) })) => match kind {
+                pb::control::Kind::Command(c) => shared.surface(Event::Command(Command {
+                    id: e.message_id,
+                    r#type: c.r#type,
+                    payload: c.payload,
+                })),
+                pb::control::Kind::Activate(a) => {
+                    let transport = pb::control::activate::Transport::try_from(a.transport)
+                        .map(|t| words(t.as_str_name(), "TRANSPORT_"))
+                        .unwrap_or_default();
+                    shared.state.lock().unwrap().active.insert(a.stream.clone());
+                    shared.surface(Event::Activated(Activated {
+                        stream: a.stream,
+                        transport,
+                        address: a.address,
+                    }));
+                }
+                pb::control::Kind::Stop(s) => {
+                    shared.state.lock().unwrap().active.remove(&s.stream);
+                    shared.surface(Event::Stopped { stream: s.stream });
+                }
+            },
+            Some(Payload::Query(pb::Query {
+                kind: Some(pb::query::Kind::Question(q)),
+            })) => shared.surface(Event::Question(Question {
+                id: e.message_id,
+                r#type: q.r#type,
+                payload: q.payload,
+            })),
+            Some(Payload::Error(err)) => shared.surface(Event::Refused {
+                correlation: e.correlation_id,
+                error: refusal_of(&err),
+            }),
+            _ => {}
+        }
+    }
+}
+
+impl Unit {
+    /// What the Core answered the registration with.
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// The next thing the Session brings, in order; `None` once the end has been surfaced. The
+    /// incarnation is then over, and the process should finish.
+    pub async fn next(&mut self) -> Option<Event> {
+        self.events.recv().await
+    }
+
+    /// Ends the Session in order: a CLOSE, the unit's own departure.
+    pub async fn close(&self) -> Result<(), Error> {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if state.ended {
+                return Ok(());
+            }
+            state.closing = true;
+        }
+        let sent = self.shared.send(Payload::Session(pb::SessionMessage {
+            kind: Some(pb::session_message::Kind::Close(
+                pb::session_message::Close {},
+            )),
+        }));
+        // Nothing more is sent: the Core ends the stream on a CLOSE.
+        self.shared.state.lock().unwrap().out = None;
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            // If the Core does not end the stream, the departure still is one.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            shared.finish(Ended {
+                closed: true,
+                cause: None,
+                line: String::new(),
+            });
+        });
+        sent
+    }
+
+    /// Says what became of a command, correlated to it.
+    pub async fn ack(&self, command: &Command, outcome: Outcome, line: &str) -> Result<(), Error> {
+        let outcome = match outcome {
+            Outcome::Accepted => pb::ack::Outcome::Accepted,
+            Outcome::Done => pb::ack::Outcome::Done,
+            Outcome::Failed => pb::ack::Outcome::Failed,
+        };
+        self.shared.answer(
+            &command.id,
+            Payload::Ack(pb::Ack {
+                outcome: outcome as i32,
+                line: line.into(),
+            }),
+        )
+    }
+
+    /// Answers a question, correlated to it.
+    pub async fn answer(&self, question: &Question, payload: Vec<u8>) -> Result<(), Error> {
+        self.shared.answer(
+            &question.id,
+            Payload::Query(pb::Query {
+                kind: Some(pb::query::Kind::Answer(pb::query::Answer { payload })),
+            }),
+        )
+    }
+
+    /// Reports an occurrence of a declared class, with the author's severity. With none it is refused:
+    /// the library never states one on the author's behalf.
+    pub async fn report(
+        &self,
+        occurrence: &str,
+        severity: Option<Severity>,
+        line: &str,
+        detail: Vec<u8>,
+    ) -> Result<(), Error> {
+        let Some(Severity(severity)) = severity else {
+            return Err(Error::Misuse(
+                "an occurrence is reported with the author's severity, and none was stated".into(),
+            ));
+        };
+        if severity > 99 {
+            return Err(Error::Misuse(format!(
+                "a severity runs from 0 to 99, and {severity} is not one"
+            )));
+        }
+        self.shared.send(Payload::Event(pb::Event {
+            occurrence: occurrence.into(),
+            severity: severity.into(),
+            line: line.into(),
+            detail,
+        }))
+    }
+
+    /// Reports how well the unit is: a grade from 0 to 99, and a line.
+    pub async fn health(&self, grade: u8, line: &str) -> Result<(), Error> {
+        if grade > 99 {
+            return Err(Error::Misuse(format!(
+                "a grade runs from 0 to 99, and {grade} is not one"
+            )));
+        }
+        self.shared.send(Payload::Health(pb::Health {
+            grade: grade.into(),
+            line: line.into(),
+        }))
+    }
+
+    /// Sends data on a stream. Only the Core creates a stream's transport, so a stream it has not
+    /// activated has nowhere to be written, and the library refuses rather than make one.
+    pub async fn emit(&self, stream: &str, payload: Vec<u8>) -> Result<(), Error> {
+        let _ = payload;
+        if !self.shared.state.lock().unwrap().active.contains(stream) {
+            return Err(Error::refusal(
+                "stream.inactive",
+                format!("the stream {stream} has not been activated"),
+            ));
+        }
+        Err(Error::refusal(
+            "stream.inactive",
+            format!("the transport of {stream} is not one this library reaches yet"),
+        ))
+    }
 }

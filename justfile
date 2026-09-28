@@ -38,7 +38,9 @@ lint:
 fmt:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo fmt --all --check
+    files="$(find . -name '*.rs' -not -path './.git/*' -not -path './target/*' | sort)"
+    if [[ -z "$files" ]]; then echo "fmt: nothing to format yet"; exit 0; fi
+    rustfmt --check --edition 2024 $files
     echo "fmt: every file is formatted"
 
 # Verify the toolchain against the floor the workspace's fan-out passes, and put the verification
