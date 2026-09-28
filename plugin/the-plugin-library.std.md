@@ -160,3 +160,16 @@
 | **Precondition** | an open Session, and no stream activated |
 | **Action** | emit on `station.spectra` |
 | **Expected** | the library refuses it with `stream.inactive`; no socket was created for the stream and nothing reached the channel |
+
+## yoke-sdk-rust:the-plugin-library.13 — a unit beats from the moment its Session opens, whatever the Core has sent
+
+| Field | Value |
+| --- | --- |
+| **Cites** | specs/50.53 · arch/50-plugin-surface/04 §Validity |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | a plugin channel that sends nothing on a Session — not even the start of its answer — until it has received two heartbeats, on terms of one every 100 ms |
+| **Action** | start a unit |
+| **Expected** | starting returns within half a second, and the channel receives the heartbeats it waits for |

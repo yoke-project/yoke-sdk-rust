@@ -34,6 +34,8 @@ struct Channel {
     seen: Arc<Mutex<Seen>>,
     answer: Arc<pb::RegisterResponse>,
     bind: PathBuf,
+    // Sends nothing on a Session, not even the start of its answer, until two heartbeats arrived.
+    quiet: bool,
 }
 
 #[tonic::async_trait]
@@ -65,7 +67,8 @@ impl Session for Channel {
         }
         let mut inbound = request.into_inner();
         let seen = self.seen.clone();
-        tokio::spawn(async move {
+        let quiet = self.quiet;
+        let reading = tokio::spawn(async move {
             while let Some(Ok(e)) = inbound.next().await {
                 let closing = matches!(&e.payload, Some(pb::envelope::Payload::Session(s))
                     if matches!(s.kind, Some(pb::session_message::Kind::Close(_))));
@@ -77,6 +80,23 @@ impl Session for Channel {
                 }
             }
         });
+        if quiet {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while self
+                .seen
+                .lock()
+                .unwrap()
+                .received
+                .iter()
+                .filter(|(_, e)| is_health(e))
+                .count()
+                < 2
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let _ = reading;
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -111,6 +131,10 @@ fn accepted() -> pb::RegisterResponse {
 }
 
 async fn bench(answer: pb::RegisterResponse) -> Bench {
+    bench_of(answer, false).await
+}
+
+async fn bench_of(answer: pb::RegisterResponse, quiet: bool) -> Bench {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ykr-{}-{}",
@@ -124,6 +148,7 @@ async fn bench(answer: pb::RegisterResponse) -> Bench {
         seen: Arc::default(),
         answer: Arc::new(answer),
         bind: bind.clone(),
+        quiet,
     };
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let served = channel.clone();
@@ -420,7 +445,7 @@ async fn the_session_opens_and_beats_on_the_cores_terms() {
 #[tokio::test]
 async fn the_end_of_a_session_is_surfaced_and_nothing_reconnects() {
     let b = bench(accepted()).await;
-    let mut unit = start_with(&station(), b.getenv()).await.unwrap();
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
     b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
         .await;
     b.send(pb::Envelope {
@@ -457,7 +482,7 @@ async fn the_end_of_a_session_is_surfaced_and_nothing_reconnects() {
 #[tokio::test]
 async fn an_orderly_close_is_the_units() {
     let b = bench(accepted()).await;
-    let mut unit = start_with(&station(), b.getenv()).await.unwrap();
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
     unit.close().await.unwrap();
     b.received(|e| matches!(&e.payload, Some(pb::envelope::Payload::Session(s)) if matches!(s.kind, Some(pb::session_message::Kind::Close(_))))).await;
     match tokio::time::timeout(Duration::from_secs(3), unit.next())
@@ -473,7 +498,7 @@ async fn an_orderly_close_is_the_units() {
 #[tokio::test]
 async fn what_the_core_sends_is_surfaced_and_answered_correlated() {
     let b = bench(accepted()).await;
-    let mut unit = start_with(&station(), b.getenv()).await.unwrap();
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
     b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
         .await;
     b.send(pb::Envelope {
@@ -595,4 +620,18 @@ async fn nothing_is_emitted_on_a_stream_not_activated() {
             .any(|(_, e)| matches!(e.payload, Some(pb::envelope::Payload::Data(_))))),
         "data reached the channel"
     );
+}
+
+// std: yoke-sdk-rust:the-plugin-library.13
+#[tokio::test]
+async fn the_unit_beats_whatever_the_core_has_sent() {
+    let b = bench_of(accepted(), true).await;
+    let _unit = tokio::time::timeout(
+        Duration::from_millis(500),
+        start_with(&station(), b.getenv()),
+    )
+    .await
+    .expect("starting waited for the Core to send something")
+    .unwrap();
+    b.received(is_health).await;
 }
