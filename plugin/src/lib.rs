@@ -129,6 +129,7 @@ impl Declaration {
             streams: self.streams.iter().map(|s| s.id.clone()).collect(),
             commands: self.commands.clone(),
             queries: self.queries.clone(),
+            occurrences: Vec::new(),
         }
     }
 }
@@ -150,13 +151,14 @@ fn scalar(value: &str) -> String {
     }
 }
 
-/// Four lists: what was granted, or what was withheld.
+/// Five lists: what was granted, or what was withheld.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scope {
     pub capabilities: Vec<String>,
     pub streams: Vec<String>,
     pub commands: Vec<String>,
     pub queries: Vec<String>,
+    pub occurrences: Vec<String>,
 }
 
 impl From<Option<pb::Surface>> for Scope {
@@ -167,6 +169,7 @@ impl From<Option<pb::Surface>> for Scope {
             streams: s.streams,
             commands: s.commands,
             queries: s.queries,
+            occurrences: Vec::new(),
         }
     }
 }

@@ -392,3 +392,28 @@ fn the_suite_is_the_published_pair_authenticated_and_never_built() {
         "the workflow does not run the suite after just test"
     );
 }
+
+// std: yoke-sdk-rust:the-harness.09
+#[tokio::test]
+async fn a_question_is_observed_with_its_bytes() {
+    let (mut suite, _) = started(restricted).await;
+    suite.directive("start", json!({})).await;
+    suite
+        .send(pb::Envelope {
+            message_id: "q-1".into(),
+            session_id: "sid-1".into(),
+            payload: Some(pb::envelope::Payload::Query(pb::Query {
+                kind: Some(pb::query::Kind::Question(pb::query::Question {
+                    r#type: "status".into(),
+                    payload: b"how are you".to_vec(),
+                })),
+            })),
+            ..Default::default()
+        })
+        .await;
+    let observed = suite.read().await;
+    assert_eq!(observed["kind"], "question", "observed {observed}");
+    assert_eq!(observed["fields"]["id"], "q-1");
+    assert_eq!(observed["fields"]["type"], "status");
+    assert_eq!(observed["fields"]["payload"], "how are you");
+}
