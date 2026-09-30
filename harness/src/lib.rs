@@ -154,7 +154,7 @@ fn value(v: Value) -> Map<String, Value> {
 }
 
 fn scope(s: &Scope) -> Value {
-    json!({"capabilities": s.capabilities, "streams": s.streams, "commands": s.commands, "queries": s.queries})
+    json!({"capabilities": s.capabilities, "streams": s.streams, "commands": s.commands, "queries": s.queries, "occurrences": s.occurrences})
 }
 
 async fn act(
@@ -263,7 +263,7 @@ async fn observe(unit: Arc<Unit>, state: Arc<Mutex<State>>, lines: Lines, ended:
                 ("command", fields)
             }
             Event::Question(q) => {
-                let fields = json!({"id": q.id, "type": q.r#type});
+                let fields = json!({"id": q.id, "type": q.r#type, "payload": String::from_utf8_lossy(&q.payload)});
                 state.lock().unwrap().questions.insert(q.id.clone(), q);
                 ("question", fields)
             }

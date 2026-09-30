@@ -129,7 +129,7 @@ impl Declaration {
             streams: self.streams.iter().map(|s| s.id.clone()).collect(),
             commands: self.commands.clone(),
             queries: self.queries.clone(),
-            occurrences: Vec::new(),
+            occurrences: self.occurrences.clone(),
         }
     }
 }
@@ -169,7 +169,7 @@ impl From<Option<pb::Surface>> for Scope {
             streams: s.streams,
             commands: s.commands,
             queries: s.queries,
-            occurrences: Vec::new(),
+            occurrences: s.occurrences,
         }
     }
 }
