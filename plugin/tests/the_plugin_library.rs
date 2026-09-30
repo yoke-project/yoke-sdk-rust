@@ -353,6 +353,7 @@ async fn the_registration_claims_what_the_manifest_declares() {
     );
     assert_eq!(declared.commands, d.commands);
     assert_eq!(declared.queries, d.queries);
+    assert_eq!(declared.occurrences, d.occurrences);
 }
 
 // std: yoke-sdk-rust:the-plugin-library.04
@@ -399,6 +400,7 @@ async fn an_acceptance_with_restrictions_names_what_was_withheld() {
     answer.withheld = Some(pb::Surface {
         streams: vec!["station.diagnostics".into()],
         capabilities: vec!["stream.diagnostics.publish".into()],
+        occurrences: vec!["calibration.drift".into()],
         ..Default::default()
     });
     let b = bench(answer).await;
@@ -411,6 +413,7 @@ async fn an_acceptance_with_restrictions_names_what_was_withheld() {
         admission.withheld.capabilities,
         vec!["stream.diagnostics.publish"]
     );
+    assert_eq!(admission.withheld.occurrences, vec!["calibration.drift"]);
 }
 
 // std: yoke-sdk-rust:the-plugin-library.07
