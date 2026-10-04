@@ -93,7 +93,7 @@
 | **Not applicable in** | — |
 | **Label** | blocking |
 | **Precondition** | a plugin channel that accepts with a heartbeat interval of 100 ms |
-| **Action** | start a unit and wait 450 ms |
+| **Action** | start a unit whose author reports its health once, as soon as it starts, and wait 450 ms |
 | **Expected** | the Session's first envelope is an `OPEN` carrying the identity admission issued; at least three heartbeats followed it, no two closer than 50 ms; the author was given no way to choose the interval |
 
 ## yoke-sdk-rust:the-plugin-library.08 — the end of a Session is surfaced, and nothing reconnects
@@ -161,7 +161,7 @@
 | **Action** | emit on `station.spectra` |
 | **Expected** | the library refuses it with `stream.inactive`; no socket was created for the stream and nothing reached the channel |
 
-## yoke-sdk-rust:the-plugin-library.13 — a unit beats from the moment its Session opens, whatever the Core has sent
+## yoke-sdk-rust:the-plugin-library.13 — a unit's reports reach the Core from the moment its Session opens, whatever the Core has sent
 
 | Field | Value |
 | --- | --- |
@@ -170,6 +170,19 @@
 | **Method** | test |
 | **Not applicable in** | — |
 | **Label** | blocking |
-| **Precondition** | a plugin channel that sends nothing on a Session — not even the start of its answer — until it has received two heartbeats, on terms of one every 100 ms |
-| **Action** | start a unit |
-| **Expected** | starting returns within half a second, and the channel receives the heartbeats it waits for |
+| **Precondition** | a plugin channel that sends nothing on a Session — not even the start of its answer — until it has received two health reports, on terms of one every 100 ms |
+| **Action** | start a unit, whose author reports its health once as soon as starting returns |
+| **Expected** | starting returns within half a second, and the channel receives the report and the beat that repeats it |
+
+## yoke-sdk-rust:the-plugin-library.14 — a beat repeats the author's last report, and says nothing before the first
+
+| Field | Value |
+| --- | --- |
+| **Cites** | specs/50.65 · specs/50.66 · specs/90.34 · arch/50-plugin-surface/05 §What a health report carries · arch/90-sdks/06 §It may not choose a severity on an author's behalf |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | a plugin channel that accepts with a heartbeat interval of 100 ms |
+| **Action** | start a unit and wait 350 ms; the author reports 40 with a line, and 350 ms pass; the author reports 10 with another line, and 350 ms pass |
+| **Expected** | no health report reaches the channel before the author's first; after it, at least two beats repeat 40 and its line; from the second on, at least two beats repeat 10 and its line, and nothing older follows it; no report carries a grade or a line the author did not state |
