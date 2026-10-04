@@ -3,9 +3,10 @@
 //! One declaration is both the Manifest the library generates and the surface its registration claims,
 //! so the two cannot be written apart. Starting a unit performs the first acts in their order: read the
 //! environment, bind the unit's own socket, register, open the Session — and then beats on the terms the
-//! Core assigned. Everything the Session brings is surfaced, its end included: a Session that ends ends
-//! the incarnation, and the library never reconnects, never retries an admission, never polls, never
-//! creates a stream's transport and never chooses a severity.
+//! Core assigned, repeating the author's last health report. Everything the Session brings is surfaced,
+//! its end included: a Session that ends ends the incarnation, and the library never reconnects, never
+//! retries an admission, never polls, never creates a stream's transport and never chooses a severity or
+//! a grade.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -256,6 +257,9 @@ impl Severity {
 struct Shared {
     envelopes: Envelopes,
     state: Mutex<State>,
+    // The author's last health report, which every beat repeats; none until one. Held while a report is
+    // read and sent, so a beat never sends a report older than one the author has already sent.
+    health: Mutex<Option<pb::Health>>,
 }
 
 struct State {
@@ -368,6 +372,7 @@ pub async fn start_with(
             closing: false,
             active: HashSet::new(),
         }),
+        health: Mutex::new(None),
     });
     // The first envelope is the OPEN, carrying the identity admission issued.
     shared.send(Payload::Session(pb::SessionMessage {
@@ -414,18 +419,19 @@ fn words(name: &str, prefix: &str) -> String {
         .replace('_', " ")
 }
 
-/// Sends a heartbeat at the interval the Core assigned, until the Session ends.
+/// Repeats the author's last health report at the interval the Core assigned, until the Session ends.
+/// Before the author's first report it sends nothing: a grade is the author's statement, and a unit that
+/// never reports loses its liveness as a unit that sends nothing does.
 async fn beat(shared: Arc<Shared>, interval: Duration) {
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     loop {
         ticker.tick().await;
-        if shared
-            .send(Payload::Health(pb::Health {
-                grade: 99,
-                line: String::new(),
-            }))
-            .is_err()
-        {
+        let last = shared.health.lock().unwrap();
+        let ended = match last.as_ref() {
+            Some(h) => shared.send(Payload::Health(h.clone())).is_err(),
+            None => shared.state.lock().unwrap().ended,
+        };
+        if ended {
             return;
         }
     }
@@ -620,17 +626,22 @@ impl Unit {
         }))
     }
 
-    /// Reports how well the unit is: a grade from 0 to 99, and a line.
+    /// Reports how well the unit is: a grade from 0 to 99, and a line. The library repeats the last
+    /// report at every beat, and sends no beat before the first: a unit keeps its liveness only once its
+    /// author has reported, so the first report must come within the tolerance the Core assigned.
     pub async fn health(&self, grade: u8, line: &str) -> Result<(), Error> {
         if grade > 99 {
             return Err(Error::Misuse(format!(
                 "a grade runs from 0 to 99, and {grade} is not one"
             )));
         }
-        self.shared.send(Payload::Health(pb::Health {
+        let report = pb::Health {
             grade: grade.into(),
             line: line.into(),
-        }))
+        };
+        let mut last = self.shared.health.lock().unwrap();
+        *last = Some(report.clone());
+        self.shared.send(Payload::Health(report))
     }
 
     /// Sends data on a stream. Only the Core creates a stream's transport, so a stream it has not
