@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use yoke_base::{Envelopes, Error, environment, refusal_of};
 use yoke_proto::plugin::v1 as pb;
+use yoke_sdk::base::{Envelopes, Error, environment, refusal_of};
 
 fn read(relative: &str) -> String {
     std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -13,7 +13,7 @@ fn read(relative: &str) -> String {
 // std: yoke-sdk-rust:the-base.01
 #[test]
 fn the_base_holds_nothing_of_one_contract() {
-    let source = read("src/lib.rs");
+    let source = read("src/base.rs");
     for forbidden in [
         "RegisterRequest",
         "RegisterResponse",
@@ -33,19 +33,11 @@ fn the_base_holds_nothing_of_one_contract() {
         !source.to_lowercase().contains("subscri"),
         "the base refers to a subscription"
     );
-    let manifest = read("Cargo.toml");
-    for line in manifest.lines() {
-        let name = line
-            .split('=')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .split('.')
-            .next()
-            .unwrap_or("");
+    // The base is a module of the crate the libraries are, and reaches nothing else of it.
+    for other in ["crate::", "super::"] {
         assert!(
-            !name.starts_with("yoke-") || name == "yoke-proto",
-            "the base depends on {name}, a library of this project"
+            !source.contains(other),
+            "the base reaches {other}, a library of this project"
         );
     }
 }

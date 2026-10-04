@@ -1,7 +1,30 @@
-# The Rust family: a base and the libraries over it. Nothing is published before 0.3, which names the
-# packages; until then the crates are source only.
+# The Rust family: one crate, yoke-sdk, carrying the base and the libraries over it as its modules, and
+# the harness beside it, which is never published.
+[package]
+name = "yoke-sdk"
+description = "The Rust libraries of Yoke: the base, and the library a Plugin unit is written with"
+repository = "https://github.com/yoke-project/yoke-sdk-rust"
+include = ["src/**", "LICENSE", "NOTICE"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yoke-proto.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+tonic = { workspace = true, features = ["router", "server"] }
+prost-types.workspace = true
+
 [workspace]
-members = ["base", "plugin", "harness"]
+members = [".", "harness"]
 resolver = "3"
 
 [workspace.package]
@@ -9,7 +32,6 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-publish = false
 
 [workspace.dependencies]
 yoke-proto = "=0.2.0"
