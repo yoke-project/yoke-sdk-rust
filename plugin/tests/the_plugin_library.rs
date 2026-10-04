@@ -420,7 +420,8 @@ async fn an_acceptance_with_restrictions_names_what_was_withheld() {
 #[tokio::test]
 async fn the_session_opens_and_beats_on_the_cores_terms() {
     let b = bench(accepted()).await;
-    let _unit = start_with(&station(), b.getenv()).await.unwrap();
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    unit.health(10, "ready").await.unwrap();
     tokio::time::sleep(Duration::from_millis(450)).await;
     let received = b.seen(|s| s.received.clone());
     let first = &received[0].1;
@@ -627,14 +628,65 @@ async fn nothing_is_emitted_on_a_stream_not_activated() {
 
 // std: yoke-sdk-rust:the-plugin-library.13
 #[tokio::test]
-async fn the_unit_beats_whatever_the_core_has_sent() {
+async fn the_units_reports_reach_the_core_whatever_it_has_sent() {
     let b = bench_of(accepted(), true).await;
-    let _unit = tokio::time::timeout(
+    let unit = tokio::time::timeout(
         Duration::from_millis(500),
         start_with(&station(), b.getenv()),
     )
     .await
     .expect("starting waited for the Core to send something")
     .unwrap();
+    unit.health(10, "ready").await.unwrap();
     b.received(is_health).await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while health_of(&b).len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the channel received {:?}",
+            health_of(&b)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Every health report the channel received, as its grade and its line.
+fn health_of(b: &Bench) -> Vec<String> {
+    b.seen(|s| {
+        s.received
+            .iter()
+            .filter_map(|(_, e)| match &e.payload {
+                Some(pb::envelope::Payload::Health(h)) => Some(format!("{} {}", h.grade, h.line)),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+// std: yoke-sdk-rust:the-plugin-library.14
+#[tokio::test]
+async fn a_beat_repeats_the_authors_last_report() {
+    let b = bench(accepted()).await;
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let before = health_of(&b);
+    assert!(
+        before.is_empty(),
+        "before the author reported, the channel received {before:?}"
+    );
+    unit.health(40, "warming").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let first = health_of(&b);
+    unit.health(10, "ready").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let all = health_of(&b);
+    let second = &all[all.iter().position(|r| r == "10 ready").unwrap()..];
+    assert!(
+        first.len() >= 3 && first.iter().all(|r| r == "40 warming"),
+        "after the first report the channel received {first:?}"
+    );
+    assert!(
+        second.len() >= 3 && second.iter().all(|r| r == "10 ready"),
+        "after the second report the channel received {second:?}"
+    );
 }
