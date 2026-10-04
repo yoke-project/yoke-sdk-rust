@@ -215,7 +215,7 @@ async fn hello_first() {
     assert_eq!(hello["type"], "hello");
     assert_eq!(hello["contract"], "plugin");
     assert_eq!(hello["language"], "rust");
-    assert_eq!(hello["sdk"], yoke_plugin::SDK_LINE);
+    assert_eq!(hello["sdk"], yoke_sdk::plugin::SDK_LINE);
     assert_eq!(hello["version"], 1);
     assert_eq!(hello["unit"], "harness");
 }

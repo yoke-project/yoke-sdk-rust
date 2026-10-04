@@ -14,8 +14,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 
-use yoke_base::{Error, PLUGIN_CONTRACT};
-use yoke_plugin::{
+use yoke_sdk::base::{Error, PLUGIN_CONTRACT};
+use yoke_sdk::plugin::{
     Capability, Command, Declaration, Event, Object, Outcome, Question, SDK_LINE, Scope, Severity,
     Stream, Unit, start_with,
 };

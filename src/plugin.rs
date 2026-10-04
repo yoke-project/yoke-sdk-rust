@@ -17,12 +17,12 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::base::{Envelopes, Error, PLUGIN_CONTRACT, Refusal, dial, environment, refusal_of};
 use pb::envelope::Payload;
-use yoke_base::{Envelopes, Error, PLUGIN_CONTRACT, Refusal, dial, environment, refusal_of};
 use yoke_proto::plugin::v1 as pb;
 
 /// What this library says it is, at admission.
-pub const SDK_LINE: &str = "yoke-sdk-rust 0.0.0";
+pub const SDK_LINE: &str = concat!("yoke-sdk-rust ", env!("CARGO_PKG_VERSION"));
 
 /// What a Plugin says about itself: what is true of the binary wherever it runs.
 #[derive(Debug, Clone, Default)]

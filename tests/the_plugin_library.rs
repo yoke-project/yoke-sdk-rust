@@ -13,11 +13,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 use pb::register_server::{Register, RegisterServer};
 use pb::session_server::{Session, SessionServer};
-use yoke_base::Error;
-use yoke_plugin::{
+use yoke_proto::plugin::v1 as pb;
+use yoke_sdk::base::Error;
+use yoke_sdk::plugin::{
     Capability, Declaration, Event, Object, Outcome, SDK_LINE, Severity, Stream, start_with,
 };
-use yoke_proto::plugin::v1 as pb;
 
 /// What the channel saw, and what it will answer.
 #[derive(Default)]
@@ -303,7 +303,7 @@ capabilities:
 #[test]
 fn nothing_the_model_does_not_have_can_be_declared() {
     let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugin.rs"),
     )
     .unwrap();
     for name in ["Declaration", "Stream", "Capability", "Object"] {

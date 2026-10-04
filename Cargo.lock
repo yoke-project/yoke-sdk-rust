@@ -720,30 +720,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yoke-base"
-version = "0.0.0"
-dependencies = [
- "hyper-util",
- "tokio",
- "tonic",
- "tower",
- "yoke-proto",
-]
-
-[[package]]
-name = "yoke-plugin"
-version = "0.0.0"
-dependencies = [
- "prost",
- "prost-types",
- "tokio",
- "tokio-stream",
- "tonic",
- "yoke-base",
- "yoke-proto",
-]
-
-[[package]]
 name = "yoke-plugin-harness"
 version = "0.0.0"
 dependencies = [
@@ -752,9 +728,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "yoke-base",
- "yoke-plugin",
  "yoke-proto",
+ "yoke-sdk",
 ]
 
 [[package]]
@@ -767,6 +742,20 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-prost",
+]
+
+[[package]]
+name = "yoke-sdk"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "yoke-proto",
 ]
 
 [[package]]
