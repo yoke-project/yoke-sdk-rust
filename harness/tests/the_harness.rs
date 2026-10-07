@@ -417,3 +417,25 @@ async fn a_question_is_observed_with_its_bytes() {
     assert_eq!(observed["fields"]["type"], "status");
     assert_eq!(observed["fields"]["payload"], "how are you");
 }
+
+// std: yoke-sdk-rust:the-harness.10
+#[test]
+fn it_declares_a_stream_on_each_transport() {
+    let d = yoke_plugin_harness::declaration();
+    let strict = d
+        .streams
+        .iter()
+        .find(|s| !s.tolerates_loss && !s.tolerates_reorder);
+    let lossy = d.streams.iter().find(|s| s.tolerates_loss);
+    let (Some(strict), Some(lossy)) = (strict, lossy) else {
+        panic!("the streams declared are {:?}", d.streams);
+    };
+    for stream in [&strict.id, &lossy.id] {
+        assert!(
+            d.capabilities
+                .iter()
+                .any(|c| matches!(&c.governs, yoke_sdk::plugin::Object::Stream(s) if s == stream)),
+            "{stream} is governed by no capability"
+        );
+    }
+}

@@ -690,3 +690,294 @@ async fn a_beat_repeats_the_authors_last_report() {
         "after the second report the channel received {second:?}"
     );
 }
+
+/// A packet socket and a datagram socket the test listens on, as the Core would for two activated
+/// streams, and an address nothing listens on.
+struct Transports {
+    ordered: String,
+    framed: String,
+    nobody: String,
+    packets: mpsc::UnboundedReceiver<Vec<u8>>,
+    datagrams: std::os::unix::net::UnixDatagram,
+}
+
+fn listening(b: &Bench) -> Transports {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let ordered = b.dir.join("spectra.sock");
+    let framed = b.dir.join("preview.sock");
+    let listener = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+    listener.bind(&SockAddr::unix(&ordered).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let (tx, packets) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let Ok((conn, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); 1 << 16];
+        loop {
+            match conn.recv(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let packet = buf[..n]
+                        .iter()
+                        .map(|b| unsafe { b.assume_init() })
+                        .collect();
+                    if tx.send(packet).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let datagrams = std::os::unix::net::UnixDatagram::bind(&framed).unwrap();
+    datagrams
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    Transports {
+        ordered: ordered.to_string_lossy().into_owned(),
+        framed: framed.to_string_lossy().into_owned(),
+        nobody: b.dir.join("nobody.sock").to_string_lossy().into_owned(),
+        packets,
+        datagrams,
+    }
+}
+
+fn control(id: &str, kind: pb::control::Kind) -> pb::Envelope {
+    pb::Envelope {
+        message_id: id.into(),
+        session_id: "sid-1".into(),
+        payload: Some(pb::envelope::Payload::Control(pb::Control {
+            kind: Some(kind),
+        })),
+        ..Default::default()
+    }
+}
+
+fn activate(
+    id: &str,
+    stream: &str,
+    transport: pb::control::activate::Transport,
+    address: &str,
+) -> pb::Envelope {
+    control(
+        id,
+        pb::control::Kind::Activate(pb::control::Activate {
+            stream: stream.into(),
+            transport: transport as i32,
+            address: address.into(),
+        }),
+    )
+}
+
+/// The acknowledgement the channel received for the message identified.
+async fn acked(b: &Bench, id: &str) -> pb::Ack {
+    let e = b
+        .received(|e| {
+            e.correlation_id == id && matches!(e.payload, Some(pb::envelope::Payload::Ack(_)))
+        })
+        .await;
+    match e.payload {
+        Some(pb::envelope::Payload::Ack(a)) => a,
+        _ => unreachable!(),
+    }
+}
+
+/// The next event the author is handed that `pick` recognises, skipping others.
+async fn handed<T>(unit: &yoke_sdk::plugin::Unit, pick: impl Fn(Event) -> Option<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(v) = unit.next().await.and_then(&pick) {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("the author was handed nothing of the kind")
+}
+
+// std: yoke-sdk-rust:the-plugin-library.15
+#[tokio::test]
+async fn an_activation_connects_the_library_and_is_acknowledged() {
+    use pb::control::activate::Transport;
+    let b = bench(accepted()).await;
+    let tr = listening(&b);
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    b.send(activate(
+        "c-1",
+        "station.spectra",
+        Transport::Ordered,
+        &tr.ordered,
+    ))
+    .await;
+    assert_eq!(
+        acked(&b, "c-1").await.outcome,
+        pb::ack::Outcome::Done as i32
+    );
+    let a = handed(&unit, |e| match e {
+        Event::Activated(a) => Some(a),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        (a.stream.as_str(), a.transport.as_str()),
+        ("station.spectra", "ordered")
+    );
+    b.send(activate(
+        "c-2",
+        "station.preview",
+        Transport::Framed,
+        &tr.framed,
+    ))
+    .await;
+    assert_eq!(
+        acked(&b, "c-2").await.outcome,
+        pb::ack::Outcome::Done as i32
+    );
+    let a = handed(&unit, |e| match e {
+        Event::Activated(a) => Some(a),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        (a.stream.as_str(), a.transport.as_str()),
+        ("station.preview", "framed")
+    );
+    b.send(activate(
+        "c-3",
+        "station.diagnostics",
+        Transport::Ordered,
+        &tr.nobody,
+    ))
+    .await;
+    let failed = acked(&b, "c-3").await;
+    assert_eq!(failed.outcome, pb::ack::Outcome::Failed as i32);
+    assert!(!failed.line.is_empty(), "the failure says nothing");
+    match unit.emit("station.diagnostics", b"x".to_vec()).await {
+        Err(Error::Refusal(r)) => assert_eq!(r.code, "stream.inactive"),
+        other => panic!("emitting on the failed stream answered {other:?}"),
+    }
+}
+
+// std: yoke-sdk-rust:the-plugin-library.16
+#[tokio::test]
+async fn emit_writes_one_envelope_per_packet_or_one_frame_per_datagram() {
+    use pb::control::activate::Transport;
+    use prost::Message;
+    let b = bench(accepted()).await;
+    let mut tr = listening(&b);
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    b.send(activate(
+        "c-1",
+        "station.spectra",
+        Transport::Ordered,
+        &tr.ordered,
+    ))
+    .await;
+    acked(&b, "c-1").await;
+    b.send(activate(
+        "c-2",
+        "station.preview",
+        Transport::Framed,
+        &tr.framed,
+    ))
+    .await;
+    acked(&b, "c-2").await;
+    for p in ["one", "two", "three"] {
+        unit.emit("station.spectra", p.as_bytes().to_vec())
+            .await
+            .unwrap();
+        unit.emit("station.preview", p.as_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+    for (n, p) in ["one", "two", "three"].iter().enumerate() {
+        let packet = tokio::time::timeout(Duration::from_secs(2), tr.packets.recv())
+            .await
+            .expect("no packet")
+            .expect("the ordered socket closed");
+        let e = pb::Envelope::decode(packet.as_slice()).expect("a packet that is not an envelope");
+        assert!(
+            !e.message_id.is_empty() && e.session_id == "sid-1" && e.sent_at_unix_nano > 0,
+            "{e:?}"
+        );
+        match e.payload {
+            Some(pb::envelope::Payload::Data(d)) => {
+                assert_eq!(
+                    (d.sequence, d.payload.as_slice()),
+                    (n as u64 + 1, p.as_bytes())
+                )
+            }
+            other => panic!("a packet carrying {other:?}"),
+        }
+        let mut buf = [0u8; 256];
+        let len = tr.datagrams.recv(&mut buf).expect("no datagram");
+        assert!(len >= 16, "a datagram shorter than a header");
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            n as u64 + 1
+        );
+        assert!(
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()) > 0,
+            "no clock"
+        );
+        assert_eq!(&buf[16..len], p.as_bytes());
+    }
+    assert!(
+        b.seen(|s| !s
+            .received
+            .iter()
+            .any(|(_, e)| matches!(e.payload, Some(pb::envelope::Payload::Data(_))))),
+        "data reached the Session"
+    );
+}
+
+// std: yoke-sdk-rust:the-plugin-library.17
+#[tokio::test]
+async fn a_stop_closes_the_transport_and_emit_is_refused_after_it() {
+    use pb::control::activate::Transport;
+    let b = bench(accepted()).await;
+    let mut tr = listening(&b);
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    b.send(activate(
+        "c-1",
+        "station.spectra",
+        Transport::Ordered,
+        &tr.ordered,
+    ))
+    .await;
+    acked(&b, "c-1").await;
+    b.send(control(
+        "c-2",
+        pb::control::Kind::Stop(pb::control::Stop {
+            stream: "station.spectra".into(),
+        }),
+    ))
+    .await;
+    assert_eq!(
+        acked(&b, "c-2").await.outcome,
+        pb::ack::Outcome::Done as i32
+    );
+    let stopped = handed(&unit, |e| match e {
+        Event::Stopped { stream } => Some(stream),
+        _ => None,
+    })
+    .await;
+    assert_eq!(stopped, "station.spectra");
+    match unit.emit("station.spectra", b"after".to_vec()).await {
+        Err(Error::Refusal(r)) => assert_eq!(r.code, "stream.inactive"),
+        other => panic!("emitting after the stop answered {other:?}"),
+    }
+    let closed = tokio::time::timeout(Duration::from_secs(2), tr.packets.recv())
+        .await
+        .expect("the connection was not closed");
+    assert!(
+        closed.is_none(),
+        "a packet reached the socket after the stop"
+    );
+}
