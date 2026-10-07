@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-plugin-harness"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "prost-types",
  "serde_json",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-sdk"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "hyper-util",
  "prost",
