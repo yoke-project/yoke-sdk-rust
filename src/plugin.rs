@@ -8,10 +8,10 @@
 //! retries an admission, never polls, never creates a stream's transport and never chooses a severity or
 //! a grade.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
@@ -267,7 +267,59 @@ struct State {
     events: Option<mpsc::UnboundedSender<Event>>,
     ended: bool,
     closing: bool,
-    active: HashSet<String>,
+    active: HashMap<String, Arc<Mutex<Emitting>>>,
+}
+
+/// One activated stream: the library's connection to its transport, and the next sequence.
+struct Emitting {
+    conn: Transport,
+    next: u64,
+}
+
+enum Transport {
+    /// One data envelope per packet.
+    Ordered(socket2::Socket),
+    /// One frame per datagram: a little-endian header of sequence and clock, then the payload.
+    Framed(std::os::unix::net::UnixDatagram),
+}
+
+/// Reaches the transport an activation names, as the Core created it.
+fn connect(a: &pb::control::Activate) -> Result<Emitting, String> {
+    let unreachable = |e: std::io::Error| {
+        format!(
+            "the transport of {} at {} cannot be reached: {e}",
+            a.stream, a.address
+        )
+    };
+    let conn = match pb::control::activate::Transport::try_from(a.transport) {
+        Ok(pb::control::activate::Transport::Ordered) => {
+            use socket2::{Domain, SockAddr, Socket, Type};
+            let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None).map_err(unreachable)?;
+            socket
+                .connect(&SockAddr::unix(&a.address).map_err(unreachable)?)
+                .map_err(unreachable)?;
+            Transport::Ordered(socket)
+        }
+        Ok(pb::control::activate::Transport::Framed) => {
+            let socket = std::os::unix::net::UnixDatagram::unbound().map_err(unreachable)?;
+            socket.connect(&a.address).map_err(unreachable)?;
+            Transport::Framed(socket)
+        }
+        _ => {
+            return Err(format!(
+                "the transport {} of {} is not one this library reaches",
+                a.transport, a.stream
+            ));
+        }
+    };
+    Ok(Emitting { conn, next: 0 })
+}
+
+fn acknowledgement(outcome: pb::ack::Outcome, line: String) -> Payload {
+    Payload::Ack(pb::Ack {
+        outcome: outcome as i32,
+        line,
+    })
 }
 
 impl Shared {
@@ -303,6 +355,7 @@ impl Shared {
         }
         state.ended = true;
         state.out = None;
+        state.active.clear();
         if let Some(events) = state.events.take() {
             let _ = events.send(Event::Ended(end));
         }
@@ -370,7 +423,7 @@ pub async fn start_with(
             events: Some(events_tx),
             ended: false,
             closing: false,
-            active: HashSet::new(),
+            active: HashMap::new(),
         }),
         health: Mutex::new(None),
     });
@@ -504,7 +557,27 @@ async fn receive(
                     let transport = pb::control::activate::Transport::try_from(a.transport)
                         .map(|t| words(t.as_str_name(), "TRANSPORT_"))
                         .unwrap_or_default();
-                    shared.state.lock().unwrap().active.insert(a.stream.clone());
+                    match connect(&a) {
+                        Ok(flow) => {
+                            shared
+                                .state
+                                .lock()
+                                .unwrap()
+                                .active
+                                .insert(a.stream.clone(), Arc::new(Mutex::new(flow)));
+                            let _ = shared.answer(
+                                &e.message_id,
+                                acknowledgement(pb::ack::Outcome::Done, String::new()),
+                            );
+                        }
+                        Err(why) => {
+                            let _ = shared.answer(
+                                &e.message_id,
+                                acknowledgement(pb::ack::Outcome::Failed, why),
+                            );
+                            continue;
+                        }
+                    }
                     shared.surface(Event::Activated(Activated {
                         stream: a.stream,
                         transport,
@@ -512,7 +585,12 @@ async fn receive(
                     }));
                 }
                 pb::control::Kind::Stop(s) => {
+                    // Dropping the connection closes it.
                     shared.state.lock().unwrap().active.remove(&s.stream);
+                    let _ = shared.answer(
+                        &e.message_id,
+                        acknowledgement(pb::ack::Outcome::Done, String::new()),
+                    );
                     shared.surface(Event::Stopped { stream: s.stream });
                 }
             },
@@ -644,19 +722,53 @@ impl Unit {
         self.shared.send(Payload::Health(report))
     }
 
-    /// Sends data on a stream. Only the Core creates a stream's transport, so a stream it has not
-    /// activated has nowhere to be written, and the library refuses rather than make one.
+    /// Sends data on a stream, on the transport its activation named: one data envelope per packet on
+    /// the ordered transport, one frame per datagram on the framed one, numbered from 1 within the
+    /// activation. Only the Core creates a stream's transport, so a stream it has not activated has
+    /// nowhere to be written, and the library refuses rather than make one.
     pub async fn emit(&self, stream: &str, payload: Vec<u8>) -> Result<(), Error> {
-        let _ = payload;
-        if !self.shared.state.lock().unwrap().active.contains(stream) {
+        let Some(flow) = self
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .get(stream)
+            .cloned()
+        else {
             return Err(Error::refusal(
                 "stream.inactive",
                 format!("the stream {stream} has not been activated"),
             ));
-        }
-        Err(Error::refusal(
-            "stream.inactive",
-            format!("the transport of {stream} is not one this library reaches yet"),
-        ))
+        };
+        let mut flow = flow.lock().unwrap();
+        flow.next += 1;
+        let sequence = flow.next;
+        let written = match &flow.conn {
+            Transport::Ordered(socket) => {
+                let e = self
+                    .shared
+                    .envelopes
+                    .seal(Payload::Data(pb::Data { sequence, payload }));
+                socket.send(&prost::Message::encode_to_vec(&e))
+            }
+            Transport::Framed(socket) => {
+                let clock = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let mut frame = Vec::with_capacity(16 + payload.len());
+                frame.extend_from_slice(&sequence.to_le_bytes());
+                frame.extend_from_slice(&clock.to_le_bytes());
+                frame.extend_from_slice(&payload);
+                socket.send(&frame)
+            }
+        };
+        written.map(|_| ()).map_err(|err| {
+            Error::refusal(
+                "stream.inactive",
+                format!("the transport of {stream} took nothing: {err}"),
+            )
+        })
     }
 }
