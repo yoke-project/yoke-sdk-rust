@@ -18,6 +18,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 socket2.workspace = true

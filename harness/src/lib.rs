@@ -20,14 +20,22 @@ use yoke_sdk::plugin::{
     Stream, Unit, start_with,
 };
 
-/// What the harness declares: one object of every kind, each governed by a capability.
+/// What the harness declares: one object of every kind, a stream on each transport, each governed by a
+/// capability.
 pub fn declaration() -> Declaration {
     Declaration {
         id: "com.yoke.conformance.rust".into(),
-        streams: vec![Stream {
-            id: "conformance.data".into(),
-            ..Default::default()
-        }],
+        streams: vec![
+            Stream {
+                id: "conformance.data".into(),
+                ..Default::default()
+            },
+            Stream {
+                id: "conformance.frames".into(),
+                tolerates_loss: true,
+                ..Default::default()
+            },
+        ],
         commands: vec!["calibrate".into()],
         queries: vec!["status".into()],
         occurrences: vec!["conformance.drift".into()],
@@ -35,6 +43,10 @@ pub fn declaration() -> Declaration {
             Capability {
                 name: "stream.data.publish".into(),
                 governs: Object::Stream("conformance.data".into()),
+            },
+            Capability {
+                name: "stream.frames.publish".into(),
+                governs: Object::Stream("conformance.frames".into()),
             },
             Capability {
                 name: "command.calibrate.accept".into(),
