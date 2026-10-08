@@ -36,7 +36,7 @@ rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-yoke-proto = "=0.2.0"
+yoke-proto = "=0.3.0"
 tonic = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
 prost = "0.14"
 prost-types = "0.14"

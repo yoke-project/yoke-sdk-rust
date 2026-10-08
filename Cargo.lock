@@ -734,9 +734,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-proto"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8020bbaac071c8ec3fc18783cc7fa187dafe7249fa7204c47516899dd36973e0"
+checksum = "472fb57efd29fe4bd02fa8d58a2a2648587c32ee8faf353e895554be9119969d"
 dependencies = [
  "prost",
  "prost-types",
