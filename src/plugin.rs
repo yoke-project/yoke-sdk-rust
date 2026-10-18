@@ -454,6 +454,7 @@ pub async fn start_with(
             code: response.code,
             message: response.message,
             stage: Some(stage_name(response.stage)),
+            ..Default::default()
         }));
     }
 

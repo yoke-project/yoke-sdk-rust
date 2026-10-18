@@ -9,18 +9,22 @@ check_one_crate_published() {
   listed="$(cd "$root" && cargo package --list --allow-dirty --quiet -p yoke-sdk 2>&1)" \
     || { echo "the crate yoke-sdk cannot be listed: $listed"; return 1; }
   local file
-  for file in Cargo.toml LICENSE NOTICE src/lib.rs src/base.rs src/plugin.rs; do
+  for file in Cargo.toml LICENSE NOTICE src/lib.rs src/base.rs src/plugin.rs src/interface.rs; do
     grep -qx "$file" <<<"$listed" || { echo "the crate does not carry $file"; return 1; }
   done
   local stray
-  stray="$(grep -E '^(harness|checks|ci|\.github)/' <<<"$listed" || true)"
+  stray="$(grep -E '^(harness|interface-harness|checks|ci|\.github)/' <<<"$listed" || true)"
   [[ -z "$stray" ]] || { echo "the crate carries $stray"; return 1; }
-  grep -qE '^pub mod base;' "$root/src/lib.rs" && grep -qE '^pub mod plugin;' "$root/src/lib.rs" \
-    || { echo "the crate does not declare the modules base and plugin"; return 1; }
-  grep -qE '^publish = false' "$root/harness/Cargo.toml" || { echo "the harness's crate does not say it is unpublished"; return 1; }
+  grep -qE '^pub mod base;' "$root/src/lib.rs" && grep -qE '^pub mod plugin;' "$root/src/lib.rs" &&
+    grep -qE '^pub mod interface;' "$root/src/lib.rs" \
+    || { echo "the crate does not declare the modules base, plugin and interface"; return 1; }
+  local harness
+  for harness in harness interface-harness; do
+    grep -qE '^publish = false' "$root/$harness/Cargo.toml" || { echo "the $harness crate does not say it is unpublished"; return 1; }
+  done
   local members
   members="$(cd "$root" && cargo metadata --no-deps --format-version 1 --quiet | grep -oE '"name":"yoke-[a-z-]+","version"' | sort -u)"
-  [[ "$members" == $'"name":"yoke-plugin-harness","version"\n"name":"yoke-sdk","version"' ]] \
+  [[ "$members" == $'"name":"yoke-interface-harness","version"\n"name":"yoke-plugin-harness","version"\n"name":"yoke-sdk","version"' ]] \
     || { echo "the workspace's crates are: $members"; return 1; }
 }
 
