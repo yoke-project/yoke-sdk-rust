@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-interface-harness"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-plugin-harness"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "prost-types",
  "serde_json",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-sdk"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "hyper-util",
  "prost",
