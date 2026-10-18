@@ -5,7 +5,7 @@
 | **Feature** | this family publishes one crate, `yoke-sdk`, carrying the base and the plugin library as its modules, at the version the tree states — which is the version the library says it is — and it publishes it with `yoke`'s published release verb, at its release tag, by trusted publishing; the harness is never published |
 | **Planning item** | yoke-project/yoke-sdk-rust#26 |
 
-## yoke-sdk-rust:the-release.01 — one crate, yoke-sdk, carries the base and the plugin library, the licence and the notice; the harness is not published
+## yoke-sdk-rust:the-release.01 — one crate, yoke-sdk, carries the base and the plugin and interface libraries, the licence and the notice; the harnesses are not published
 
 | Field | Value |
 | --- | --- |
@@ -16,7 +16,7 @@
 | **Label** | blocking |
 | **Precondition** | a clean checkout |
 | **Action** | list what the crate `yoke-sdk` would carry, and read the workspace's manifests |
-| **Expected** | it carries its manifest, `LICENSE`, `NOTICE`, and the sources of `yoke_sdk::base` and `yoke_sdk::plugin`, and nothing of the harness, the checks or the scripts; the harness's crate says it is not published, and no other crate of the workspace is published |
+| **Expected** | it carries its manifest, `LICENSE`, `NOTICE`, and the sources of `yoke_sdk::base`, `yoke_sdk::plugin` and `yoke_sdk::interface`, and nothing of the harnesses, the checks or the scripts; each harness's crate says it is not published, and no other crate of the workspace is published |
 
 ## yoke-sdk-rust:the-release.02 — the crate is packaged at the tree's version and no other, and the library says that version
 

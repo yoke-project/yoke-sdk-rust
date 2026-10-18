@@ -1,0 +1,24 @@
+[package]
+name = "yoke-interface-harness"
+description = "The Rust interface library's harness, which the conformance suite drives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "yoke-rust-interface-harness"
+path = "src/main.rs"
+
+[dependencies]
+yoke-sdk = { path = ".." }
+yoke-proto.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tonic = { workspace = true, features = ["router", "server"] }
+tokio-stream.workspace = true
+prost.workspace = true

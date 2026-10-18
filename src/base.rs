@@ -72,13 +72,33 @@ pub async fn dial(path: &Path) -> Result<Channel, Error> {
         .map_err(|e| Error::Transport(e.to_string()))
 }
 
-/// A refusal as it travels: a code from the one namespace, a message for a person, and the stage where
-/// there is one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a refusal names when it is about one subject: a kind, an identity, and a unit's life where one is
+/// named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subject {
+    pub kind: String,
+    pub identity: String,
+    pub incarnation: u64,
+}
+
+/// Why a channel's operation was withdrawn: the grade it is suspended in, and the channel that prevails.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Suspension {
+    pub grade: String,
+    pub by: String,
+}
+
+/// A refusal as it travels: a code from the one namespace, a message for a person, the stage where there
+/// is one, and what it names where it names anything: a subject, an object withheld or undeclared, or the
+/// suspension of a channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Refusal {
     pub code: String,
     pub message: String,
     pub stage: Option<String>,
+    pub subject: Option<Subject>,
+    pub item: Option<String>,
+    pub suspension: Option<Suspension>,
 }
 
 impl std::fmt::Display for Refusal {
@@ -119,7 +139,7 @@ impl Error {
         Error::Refusal(Refusal {
             code: code.into(),
             message: message.into(),
-            stage: None,
+            ..Default::default()
         })
     }
 }
@@ -135,7 +155,7 @@ pub fn refusal_of(e: &pb::Error) -> Error {
     Error::Refusal(Refusal {
         code: e.code.clone(),
         message: e.message.clone(),
-        stage: None,
+        ..Default::default()
     })
 }
 

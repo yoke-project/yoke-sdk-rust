@@ -57,6 +57,7 @@ run_suite() {
   "$suite/yoke-conformance" --core "$suite/yoke-core" "${report[@]}" --harness "$1"
 }
 
-(cd "$root" && cargo build --quiet --locked -p yoke-plugin-harness)
+(cd "$root" && cargo build --quiet --locked -p yoke-plugin-harness -p yoke-interface-harness)
 mkdir -p "$results"
 run_suite "$root/target/debug/yoke-rust-plugin-harness" | tee "$results/conformance.txt"
+run_suite "$root/target/debug/yoke-rust-interface-harness" | tee -a "$results/conformance.txt"

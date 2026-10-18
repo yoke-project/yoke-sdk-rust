@@ -3,9 +3,10 @@
 ## What it is
 
 The Rust family of Yoke's SDKs: the library a Rust program uses to run as a Plugin unit in a Yoke
-instance, over a base it shares with the libraries to come, and the harness that holds it to the
-contract under the conformance suite. It is published as one crate, `yoke-sdk`, with the modules
-`yoke_sdk::base` and `yoke_sdk::plugin`.
+instance, the library an interface client attaches to a channel with — on a local socket, or over TLS
+1.3 at a routable address — over a base they share, and the harnesses that hold each to its contract
+under the conformance suite. It is published as one crate, `yoke-sdk`, with the modules
+`yoke_sdk::base`, `yoke_sdk::plugin` and `yoke_sdk::interface`.
 
 It is not the Core, and it holds no contract definitions of its own: it takes them from the
 `yoke-proto` crate.
@@ -16,7 +17,9 @@ It is not the Core, and it holds no contract definitions of its own: it takes th
 | --- | --- |
 | `src/base.rs` | What the libraries share: the connection, the envelope, a refusal as an error |
 | `src/plugin.rs` | The library a Plugin unit is written with |
-| `harness/` | The library's harness for the conformance suite, a crate of the workspace that is never published |
+| `src/interface.rs` | The library an interface client is written with, and `src/tls.rs`, the TLS 1.3 it carries itself |
+| `harness/` | The plugin library's harness for the conformance suite, a crate of the workspace that is never published |
+| `interface-harness/` | The interface library's harness, likewise |
 | `tests/` | The libraries' tests, each beside its description (`.std.md`) |
 | `checks/`, `ci/` | This repository's own checks, and the scripts continuous integration runs |
 
