@@ -19,6 +19,7 @@ tokio-stream.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
 socket2.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 socket2.workspace = true
@@ -36,7 +37,7 @@ rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-yoke-proto = "=0.3.0"
+yoke-proto = "=0.4.0"
 tonic = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
 prost = "0.14"
 prost-types = "0.14"
@@ -46,3 +47,4 @@ tokio-stream = { version = "0.1", features = ["net"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
 socket2 = { version = "0.6", features = ["all"] }
+rustix = { version = "1", features = ["fs", "mm", "net", "thread"] }

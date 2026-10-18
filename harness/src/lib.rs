@@ -281,7 +281,8 @@ async fn observe(unit: Arc<Unit>, state: Arc<Mutex<State>>, lines: Lines, ended:
             }
             Event::Activated(a) => (
                 "activated",
-                json!({"stream": a.stream, "transport": a.transport}),
+                // The suite names the transports `ordered`, `framed` and `shared_object`.
+                json!({"stream": a.stream, "transport": a.transport.replace(' ', "_")}),
             ),
             Event::Stopped { stream } => ("stopped", json!({"stream": stream})),
             Event::Refused { correlation, error } => {
