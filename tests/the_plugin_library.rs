@@ -981,3 +981,148 @@ async fn a_stop_closes_the_transport_and_emit_is_refused_after_it() {
         "a packet reached the socket after the stop"
     );
 }
+
+/// A ring of layout 1 behind a packet socket, as the Core creates one: the first connection is handed the
+/// descriptor that writes, on one byte.
+struct CoreRing {
+    path: String,
+    mem: usize,
+    slots: usize,
+    capacity: usize,
+}
+
+fn core_ring(b: &Bench, slots: usize, capacity: usize) -> CoreRing {
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+    use rustix::mm::{MapFlags, ProtFlags, mmap};
+    use rustix::net::{RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::AsFd;
+
+    let size = 64 + slots * (32 + capacity);
+    let fd = memfd_create("yoke-test", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, size as u64).unwrap();
+    let mem = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            size,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &fd,
+            0,
+        )
+    }
+    .unwrap() as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"YOKERING".as_ptr(), mem, 8);
+        (mem.add(8) as *mut u32).write(1u32.to_le());
+        (mem.add(12) as *mut u32).write((slots as u32).to_le());
+        (mem.add(16) as *mut u32).write((capacity as u32).to_le());
+    }
+    let path = b.dir.join("ring.sock");
+    let listener = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    std::thread::spawn(move || {
+        let Ok((conn, _)) = listener.accept() else {
+            return;
+        };
+        let fds = [fd.as_fd()];
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        control.push(SendAncillaryMessage::ScmRights(&fds));
+        let _ = sendmsg(
+            &conn,
+            &[std::io::IoSlice::new(&[0])],
+            &mut control,
+            SendFlags::empty(),
+        );
+        // The Core keeps the socket open for the life of the stream.
+        let mut hold = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        let _ = conn.recv(&mut hold);
+        let _ = RecvFlags::empty();
+    });
+    CoreRing {
+        path: path.to_string_lossy().into_owned(),
+        mem: mem as usize,
+        slots,
+        capacity,
+    }
+}
+
+impl CoreRing {
+    fn published(&self) -> u64 {
+        u64::from_le(unsafe { std::ptr::read_volatile((self.mem + 24) as *const u64) })
+    }
+
+    /// Frame `n`'s sequence, clock and payload as its slot holds them.
+    fn slot(&self, n: u64) -> (u64, u64, Vec<u8>) {
+        let at = self.mem + 64 + ((n - 1) as usize % self.slots) * (32 + self.capacity);
+        unsafe {
+            let length = u32::from_le(std::ptr::read_volatile((at + 16) as *const u32)) as usize;
+            (
+                u64::from_le(std::ptr::read_volatile(at as *const u64)),
+                u64::from_le(std::ptr::read_volatile((at + 8) as *const u64)),
+                std::slice::from_raw_parts((at + 32) as *const u8, length).to_vec(),
+            )
+        }
+    }
+}
+
+// std: yoke-sdk-rust:the-plugin-library.18
+#[tokio::test]
+async fn activated_on_the_ring_emit_publishes_into_it() {
+    use pb::control::activate::Transport;
+    let b = bench(accepted()).await;
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    assert!(
+        b.seen(|s| s.registrations[0].transports.clone())
+            .contains(&(Transport::SharedObject as i32)),
+        "the registration does not offer the shared ring"
+    );
+    let ring = core_ring(&b, 4, 64);
+    b.send(activate(
+        "c-1",
+        "station.preview",
+        Transport::SharedObject,
+        &ring.path,
+    ))
+    .await;
+    assert_eq!(
+        acked(&b, "c-1").await.outcome,
+        pb::ack::Outcome::Done as i32,
+        "the activation on the ring was not acknowledged done"
+    );
+    let a = handed(&unit, |e| match e {
+        Event::Activated(a) => Some(a),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        (a.stream.as_str(), a.transport.as_str()),
+        ("station.preview", "shared object")
+    );
+    for i in 1..=3u8 {
+        unit.emit("station.preview", vec![i, 0xdd]).await.unwrap();
+    }
+    assert_eq!(ring.published(), 3);
+    for n in 1..=3u64 {
+        let (sequence, clock, payload) = ring.slot(n);
+        assert_eq!(sequence, n, "frame {n}");
+        assert_ne!(clock, 0, "frame {n} has no clock");
+        assert_eq!(payload, vec![n as u8, 0xdd], "frame {n}");
+    }
+    match unit.emit("station.preview", vec![0; 65]).await {
+        Err(Error::Refusal(r)) => {
+            assert_eq!(r.code, "stream.inactive");
+            assert!(
+                r.message.contains("64"),
+                "the refusal does not name the capacity: {}",
+                r.message
+            );
+        }
+        other => panic!("a payload larger than a slot answered {other:?}"),
+    }
+    assert_eq!(ring.published(), 3, "the refused frame was published");
+}

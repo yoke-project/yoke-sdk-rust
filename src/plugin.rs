@@ -281,6 +281,9 @@ enum Transport {
     Ordered(socket2::Socket),
     /// One frame per datagram: a little-endian header of sequence and clock, then the payload.
     Framed(std::os::unix::net::UnixDatagram),
+    /// The ring the Core created, written into; the connection is held for the stream's life, since the
+    /// Core closing it ends the stream.
+    Ring(#[allow(dead_code)] socket2::Socket, crate::ring::Writer),
 }
 
 /// Reaches the transport an activation names, as the Core created it.
@@ -305,6 +308,7 @@ fn connect(a: &pb::control::Activate) -> Result<Emitting, String> {
             socket.connect(&a.address).map_err(unreachable)?;
             Transport::Framed(socket)
         }
+        Ok(pb::control::activate::Transport::SharedObject) => connect_ring(a)?,
         _ => {
             return Err(format!(
                 "the transport {} of {} is not one this library reaches",
@@ -313,6 +317,43 @@ fn connect(a: &pb::control::Activate) -> Result<Emitting, String> {
         }
     };
     Ok(Emitting { conn, next: 0 })
+}
+
+/// Reaches a stream's ring: connects to the socket the activation names and takes the descriptor the Core
+/// hands the first connection, on one byte.
+fn connect_ring(a: &pb::control::Activate) -> Result<Transport, String> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let ring = |why: String| format!("the ring of {}: {why}", a.stream);
+    let socket =
+        Socket::new(Domain::UNIX, Type::SEQPACKET, None).map_err(|e| ring(e.to_string()))?;
+    socket
+        .connect(&SockAddr::unix(&a.address).map_err(|e| ring(e.to_string()))?)
+        .map_err(|e| {
+            format!(
+                "the ring of {} at {} cannot be reached: {e}",
+                a.stream, a.address
+            )
+        })?;
+    let mut byte = [0u8; 1];
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    recvmsg(
+        &socket,
+        &mut [std::io::IoSliceMut::new(&mut byte)],
+        &mut control,
+        RecvFlags::empty(),
+    )
+    .map_err(|e| ring(format!("no descriptor was handed: {e}")))?;
+    let mut handed = None;
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = message {
+            handed = fds.into_iter().next();
+        }
+    }
+    let fd = handed.ok_or_else(|| ring("no descriptor was handed".into()))?;
+    let writer = crate::ring::Writer::open(&fd).map_err(ring)?;
+    Ok(Transport::Ring(socket, writer))
 }
 
 fn acknowledgement(outcome: pb::ack::Outcome, line: String) -> Payload {
@@ -400,6 +441,8 @@ pub async fn start_with(
             language: "rust".into(),
             sdk_line: SDK_LINE.into(),
             declared: Some(d.surface()),
+            // This library writes the shared ring, so a stream of it that tolerates loss may be carried there.
+            transports: vec![pb::control::activate::Transport::SharedObject as i32],
             ..Default::default()
         })
         .await?
@@ -744,13 +787,13 @@ impl Unit {
         let mut flow = flow.lock().unwrap();
         flow.next += 1;
         let sequence = flow.next;
-        let written = match &flow.conn {
+        let written = match &mut flow.conn {
             Transport::Ordered(socket) => {
                 let e = self
                     .shared
                     .envelopes
                     .seal(Payload::Data(pb::Data { sequence, payload }));
-                socket.send(&prost::Message::encode_to_vec(&e))
+                socket.send(&prost::Message::encode_to_vec(&e)).map(|_| ())
             }
             Transport::Framed(socket) => {
                 let clock = SystemTime::now()
@@ -761,9 +804,19 @@ impl Unit {
                 frame.extend_from_slice(&sequence.to_le_bytes());
                 frame.extend_from_slice(&clock.to_le_bytes());
                 frame.extend_from_slice(&payload);
-                socket.send(&frame)
+                socket.send(&frame).map(|_| ())
+            }
+            Transport::Ring(_, ring) => {
+                let clock = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                ring.publish(clock, &payload).map_err(std::io::Error::other)
             }
         };
+        if written.is_err() {
+            flow.next -= 1;
+        }
         written.map(|_| ()).map_err(|err| {
             Error::refusal(
                 "stream.inactive",

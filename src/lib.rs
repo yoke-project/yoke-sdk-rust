@@ -3,3 +3,4 @@
 
 pub mod base;
 pub mod plugin;
+mod ring;
