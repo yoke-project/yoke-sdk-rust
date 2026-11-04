@@ -1,0 +1,9 @@
+plugin: 1
+id: @YOKE_ID@
+language: rust
+program: @YOKE_PROGRAM@
+manifest: plugin/@YOKE_ID@.yaml
+build:
+  in: plugin/
+  run: cargo build --release --target "$YOKE_RUST_TARGET" && cp "target/$YOKE_RUST_TARGET/release/@YOKE_PROGRAM@" "$YOKE_OUT/@YOKE_PROGRAM@"
+architectures: [x86_64, aarch64]

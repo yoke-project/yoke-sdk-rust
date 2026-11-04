@@ -32,6 +32,8 @@ tonic = { workspace = true, features = ["router", "server"] }
 
 [workspace]
 members = [".", "harness", "interface-harness"]
+# The Plugin template is a program of its own, handed over with each release and built nowhere here.
+exclude = ["template"]
 resolver = "3"
 
 [workspace.package]
