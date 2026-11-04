@@ -20,6 +20,7 @@ It is not the Core, and it holds no contract definitions of its own: it takes th
 | `src/interface.rs` | The library an interface client is written with, and `src/tls.rs`, the TLS 1.3 it carries itself |
 | `harness/` | The plugin library's harness for the conformance suite, a crate of the workspace that is never published |
 | `interface-harness/` | The interface library's harness, likewise |
+| `template/` | The starting tree of a Plugin project in Rust, handed over with each release for `yoke-compose new plugin` |
 | `tests/` | The libraries' tests, each beside its description (`.std.md`) |
 | `checks/`, `ci/` | This repository's own checks, and the scripts continuous integration runs |
 
