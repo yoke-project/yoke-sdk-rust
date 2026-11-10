@@ -1126,3 +1126,84 @@ async fn activated_on_the_ring_emit_publishes_into_it() {
     }
     assert_eq!(ring.published(), 3, "the refused frame was published");
 }
+
+// std: yoke-sdk-rust:the-plugin-library.19
+#[tokio::test]
+async fn every_family_a_unit_originates_has_an_act() {
+    let b = bench(accepted()).await;
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    b.send(control(
+        "c-1",
+        pb::control::Kind::Command(pb::control::Command {
+            r#type: "calibrate".into(),
+            payload: vec![],
+        }),
+    ))
+    .await;
+    b.send(pb::Envelope {
+        message_id: "c-2".into(),
+        session_id: "sid-1".into(),
+        payload: Some(pb::envelope::Payload::Query(pb::Query {
+            kind: Some(pb::query::Kind::Question(pb::query::Question {
+                r#type: "head-status".into(),
+                payload: vec![],
+            })),
+        })),
+        ..Default::default()
+    })
+    .await;
+    let command = handed(&unit, |e| match e {
+        Event::Command(c) => Some(c),
+        _ => None,
+    })
+    .await;
+    let question = handed(&unit, |e| match e {
+        Event::Question(q) => Some(q),
+        _ => None,
+    })
+    .await;
+    unit.ack(&command, Outcome::Accepted, "starting")
+        .await
+        .unwrap();
+    unit.ack(&command, Outcome::Done, "").await.unwrap();
+    unit.fail(&question.id, "head.unreachable", "the head does not answer")
+        .await
+        .unwrap();
+    let error = b
+        .received(|e| matches!(e.payload, Some(pb::envelope::Payload::Error(_))))
+        .await;
+    assert_eq!(error.correlation_id, "c-2");
+    match error.payload {
+        Some(pb::envelope::Payload::Error(err)) => {
+            assert_eq!(err.code, "head.unreachable");
+            assert_eq!(err.message, "the head does not answer");
+        }
+        other => panic!("not an error: {other:?}"),
+    }
+    let outcomes = b.seen(|s| {
+        s.received
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| e.correlation_id == "c-1")
+            .filter_map(|e| match &e.payload {
+                Some(pb::envelope::Payload::Ack(a)) => Some(a.outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        outcomes,
+        vec![
+            pb::ack::Outcome::Accepted as i32,
+            pb::ack::Outcome::Done as i32
+        ]
+    );
+    let answered = b.seen(|s| {
+        s.received
+            .iter()
+            .any(|(_, e)| matches!(e.payload, Some(pb::envelope::Payload::Query(_))))
+    });
+    assert!(!answered, "the question was answered as well as failed");
+}

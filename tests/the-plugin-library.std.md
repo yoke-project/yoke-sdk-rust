@@ -239,3 +239,16 @@
 | **Action** | read the registration the channel received; activate a stream on the shared object at that socket; emit three payloads; then one larger than a slot |
 | **Expected** | the registration offers the shared object; the activation is acknowledged done and the author is handed it, naming the transport `shared object`; frames 1, 2 and 3 are in their slots with the payloads emitted, a clock each, and the count published is 3; the payload larger than a slot is refused with `stream.inactive`, naming the capacity, and nothing more is published |
 
+
+## yoke-sdk-rust:the-plugin-library.19 — every family a unit originates has an act, the error family among them
+
+| Field | Value |
+| --- | --- |
+| **Cites** | specs/50.61 · specs/50.68 · specs/50.102 · specs/90.10 · arch/50-plugin-surface/05 §The eight · arch/50-plugin-surface/05 §Direction is a rule of its own · arch/50-plugin-surface/05 §An error answering the Core's message closes the exchange |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | an open Session, and a command and a question the channel sent |
+| **Action** | the author accepts the command and then says it is done; says what went wrong with the question, with a code and a message |
+| **Expected** | two acknowledgements correlated to the command, `accepted` then `done`; an error correlated to the question, carrying the code and the message, and no answer to it |

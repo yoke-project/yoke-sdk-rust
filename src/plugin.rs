@@ -721,6 +721,20 @@ impl Unit {
         )
     }
 
+    /// Says what went wrong with a message the Core sent, correlated to it: a code in the unit's own
+    /// terms and a message for a person. It is the unit's answer, so the exchange closes and whoever
+    /// asked is refused with the code carried. A question failed is not also answered.
+    pub async fn fail(&self, about: &str, code: &str, message: &str) -> Result<(), Error> {
+        self.shared.answer(
+            about,
+            Payload::Error(pb::Error {
+                code: code.into(),
+                message: message.into(),
+                detail: None,
+            }),
+        )
+    }
+
     /// Reports an occurrence of a declared class, with the author's severity. With none it is refused:
     /// the library never states one on the author's behalf.
     pub async fn report(
