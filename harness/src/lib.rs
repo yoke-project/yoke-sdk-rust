@@ -208,7 +208,15 @@ async fn act(
         }
         _ => {}
     }
-    let known = ["close", "emit", "report-health", "report", "ack", "answer"];
+    let known = [
+        "close",
+        "emit",
+        "report-health",
+        "report",
+        "ack",
+        "answer",
+        "fail",
+    ];
     let Some(unit) = state.lock().unwrap().unit.clone() else {
         if known.contains(&verb) {
             return value(json!({"failed": true, "started": false}));
@@ -252,6 +260,11 @@ async fn act(
                 Some(q) => unit.answer(&q, arg("payload").into_bytes()).await,
                 None => Err(Error::Misuse("no such question was surfaced".into())),
             }
+        }
+        // A question or a command the Core sent, failed with a code and a message, correlated to it.
+        "fail" => {
+            unit.fail(&arg("about"), &arg("code"), &arg("message"))
+                .await
         }
         _ => {
             let mut line = Map::new();
