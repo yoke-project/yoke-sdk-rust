@@ -671,17 +671,49 @@ impl Attachment {
     /// Asks for a copy of a unit's stream, and opens it where the answer says it arrives: a per-subscriber
     /// socket the Core listens on, or the attachment's own connection.
     pub async fn subscribe_stream(&self, unit: &str, stream: &str) -> Result<Delivery, Error> {
+        self.subscribe_stream_reading(unit, stream, &[Reads::StreamSocket, Reads::SharedObject])
+            .await
+    }
+
+    /// `subscribe_stream` naming only the deliveries given; with none, the packet socket every library
+    /// reads.
+    pub async fn subscribe_stream_reading(
+        &self,
+        unit: &str,
+        stream: &str,
+        reads: &[Reads],
+    ) -> Result<Delivery, Error> {
         let resp = self
             .call(pb::request::Operation::StreamSubscribe(pb::UnitStream {
                 unit: unit.into(),
                 stream: stream.into(),
-                reads: vec![],
+                reads: reads.iter().map(|r| *r as i32).collect(),
             }))
             .await?;
         let Some(pb::response::Answer::StreamSubscribe(d)) = resp.answer else {
             return Err(unexpected("stream.subscribe"));
         };
+        let mut arrives = "socket";
         let source = match &d.arrives {
+            Some(pb::delivering::Arrives::StreamSocket(path)) => {
+                arrives = "stream_socket";
+                Source::Stream(tokio::net::UnixStream::connect(path).await.map_err(|e| {
+                    Error::Transport(format!(
+                        "the delivery's socket {path} cannot be reached: {e}"
+                    ))
+                })?)
+            }
+            Some(pb::delivering::Arrives::Shared(path)) => {
+                arrives = "shared";
+                let lifeline = std::os::unix::net::UnixStream::connect(path).map_err(|e| {
+                    Error::Transport(format!(
+                        "the delivery's lifeline {path} cannot be reached: {e}"
+                    ))
+                })?;
+                let (tx, rx) = mpsc::unbounded_channel();
+                std::thread::spawn(move || read_the_ring(lifeline, tx));
+                Source::Shared(rx)
+            }
             Some(pb::delivering::Arrives::Socket(path)) => {
                 Source::Socket(SeqSocket::connect(path).map_err(|e| {
                     Error::Transport(format!(
@@ -690,6 +722,7 @@ impl Attachment {
                 })?)
             }
             Some(pb::delivering::Arrives::Connection(_)) => {
+                arrives = "connection";
                 match self.inner.register(&d.delivery) {
                     Some(frames) => Source::Connection(frames),
                     None => return Err(ended()),
@@ -705,6 +738,7 @@ impl Attachment {
         Ok(Delivery {
             id: d.delivery,
             flowing: d.flowing,
+            arrives: arrives.into(),
             inner: self.inner.clone(),
             source,
         })
@@ -844,6 +878,107 @@ impl SeqSocket {
 enum Source {
     Socket(SeqSocket),
     Connection(Frames),
+    /// A stream socket: each frame after its length, a u32 little-endian.
+    Stream(tokio::net::UnixStream),
+    /// The stream's ring itself, read on a thread of its own; `None` once the lifeline closed.
+    Shared(mpsc::UnboundedReceiver<Option<Frame>>),
+}
+
+/// What this library can read a delivery from, beyond the per-subscriber packet socket.
+pub use pb::unit_stream::Reads;
+
+/// Reads a shared delivery: the lifeline brings each activation's ring as a descriptor on one byte and each
+/// stop as a message of length zero, and its closing is the end; between them, the ring is read frame by
+/// frame. It runs on a thread of its own, so a wait on the ring's word blocks nothing asynchronous.
+fn read_the_ring(
+    lifeline: std::os::unix::net::UnixStream,
+    tx: mpsc::UnboundedSender<Option<Frame>>,
+) {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    let mut ring: Option<crate::ring::Reader> = None;
+    loop {
+        let _ = lifeline.set_read_timeout(Some(Duration::from_millis(if ring.is_some() {
+            20
+        } else {
+            1000
+        })));
+        let mut head = [0u8; 5];
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        match recvmsg(
+            &lifeline,
+            &mut [std::io::IoSliceMut::new(&mut head[..4])],
+            &mut control,
+            RecvFlags::empty(),
+        ) {
+            Ok(r) if r.bytes == 0 => {
+                let _ = tx.send(None);
+                return;
+            }
+            Ok(r) => {
+                let mut handed = None;
+                for message in control.drain() {
+                    if let RecvAncillaryMessage::ScmRights(fds) = message {
+                        handed = fds.into_iter().next();
+                    }
+                }
+                let mut got = r.bytes;
+                let _ = lifeline.set_read_timeout(Some(Duration::from_secs(5)));
+                while got < 4 {
+                    match std::io::Read::read(&mut &lifeline, &mut head[got..4]) {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(None);
+                            return;
+                        }
+                        Ok(n) => got += n,
+                    }
+                }
+                let length = u32::from_le_bytes(head[..4].try_into().unwrap());
+                if length == 0 {
+                    ring = None;
+                    continue;
+                }
+                let mut body = vec![0u8; length as usize];
+                let mut space =
+                    [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = RecvAncillaryBuffer::new(&mut space);
+                if recvmsg(
+                    &lifeline,
+                    &mut [std::io::IoSliceMut::new(&mut body)],
+                    &mut control,
+                    RecvFlags::empty(),
+                )
+                .is_err()
+                {
+                    let _ = tx.send(None);
+                    return;
+                }
+                for message in control.drain() {
+                    if let RecvAncillaryMessage::ScmRights(fds) = message {
+                        handed = handed.or(fds.into_iter().next());
+                    }
+                }
+                ring = handed.and_then(|fd| crate::ring::Reader::open(&fd).ok());
+            }
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {}
+            Err(_) => {
+                let _ = tx.send(None);
+                return;
+            }
+        }
+        if let Some(r) = ring.as_mut() {
+            while let Some(f) = r.next(Duration::from_millis(50)) {
+                let frame = Frame {
+                    sequence: f.sequence,
+                    sent_at: f.clock,
+                    payload: f.payload,
+                };
+                if tx.send(Some(frame)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// A copy of a stream delivered to this client, read where the answer said it arrives. `flowing` is
@@ -851,6 +986,8 @@ enum Source {
 pub struct Delivery {
     pub id: String,
     pub flowing: bool,
+    /// Where the Core said the delivery arrives: "socket", "stream_socket", "shared" or "connection".
+    pub arrives: String,
     inner: Arc<Inner>,
     source: Source,
 }
@@ -860,6 +997,29 @@ impl Delivery {
     /// attachment did.
     pub async fn next(&mut self) -> Result<Option<Frame>, Error> {
         match &mut self.source {
+            Source::Stream(socket) => {
+                use tokio::io::AsyncReadExt as _;
+                let mut head = [0u8; 4];
+                if socket.read_exact(&mut head).await.is_err() {
+                    return Ok(None);
+                }
+                let mut body = vec![0u8; u32::from_le_bytes(head) as usize];
+                if socket.read_exact(&mut body).await.is_err() {
+                    return Ok(None);
+                }
+                if body.len() < HEADER {
+                    return Err(Error::Transport(format!(
+                        "a frame of {} bytes is shorter than its header",
+                        body.len()
+                    )));
+                }
+                Ok(Some(Frame {
+                    sequence: u64::from_le_bytes(body[0..8].try_into().unwrap()),
+                    sent_at: u64::from_le_bytes(body[8..16].try_into().unwrap()),
+                    payload: body[HEADER..].to_vec(),
+                }))
+            }
+            Source::Shared(rx) => Ok(rx.recv().await.flatten()),
             Source::Socket(socket) => {
                 let mut buf = vec![MaybeUninit::<u8>::uninit(); PACKET];
                 let n = match socket.recv(&mut buf).await {
