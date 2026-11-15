@@ -252,3 +252,16 @@
 | **Precondition** | an open Session, and a command and a question the channel sent |
 | **Action** | the author accepts the command and then says it is done; says what went wrong with the question, with a code and a message |
 | **Expected** | two acknowledgements correlated to the command, `accepted` then `done`; an error correlated to the question, carrying the code and the message, and no answer to it |
+
+## yoke-sdk-rust:the-plugin-library.20 — on a stream socket, emit writes each message after its length; the registration offers it, and the Manifest declares the largest frame
+
+| Field | Value |
+| --- | --- |
+| **Cites** | arch/50-plugin-surface/07 §What the two tolerances select · arch/50-plugin-surface/08 §Where the data goes · arch/50-plugin-surface/02 §The four declared lists |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | a declaration whose stream `station.raw` declares `max_frame` 4 MiB |
+| **Action** | the Manifest is generated; a unit is started; the Core activates a stream on `TRANSPORT_FRAMED_STREAM`, and emit sends 600 KiB |
+| **Expected** | the Manifest says `max_frame: 4194304` for that stream alone; the registration offers the shared object and both stream transports; the stream socket reads a `u32` little-endian length and then the frame of sequence 1, whole |

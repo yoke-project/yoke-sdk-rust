@@ -604,6 +604,7 @@ impl Attachment {
             .call(pb::request::Operation::StreamStart(pb::UnitStream {
                 unit: unit.into(),
                 stream: stream.into(),
+                reads: vec![],
             }))
             .await?;
         match resp.answer {
@@ -618,6 +619,7 @@ impl Attachment {
             .call(pb::request::Operation::StreamStop(pb::UnitStream {
                 unit: unit.into(),
                 stream: stream.into(),
+                reads: vec![],
             }))
             .await?;
         match resp.answer {
@@ -673,6 +675,7 @@ impl Attachment {
             .call(pb::request::Operation::StreamSubscribe(pb::UnitStream {
                 unit: unit.into(),
                 stream: stream.into(),
+                reads: vec![],
             }))
             .await?;
         let Some(pb::response::Answer::StreamSubscribe(d)) = resp.answer else {

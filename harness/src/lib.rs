@@ -35,6 +35,12 @@ pub fn declaration() -> Declaration {
                 tolerates_loss: true,
                 ..Default::default()
             },
+            Stream {
+                id: "conformance.large".into(),
+                tolerates_loss: true,
+                max_frame: 4 << 20,
+                ..Default::default()
+            },
         ],
         commands: vec!["calibrate".into()],
         queries: vec!["status".into()],
@@ -47,6 +53,10 @@ pub fn declaration() -> Declaration {
             Capability {
                 name: "stream.frames.publish".into(),
                 governs: Object::Stream("conformance.frames".into()),
+            },
+            Capability {
+                name: "stream.large.publish".into(),
+                governs: Object::Stream("conformance.large".into()),
             },
             Capability {
                 name: "command.calibrate.accept".into(),
@@ -211,6 +221,7 @@ async fn act(
     let known = [
         "close",
         "emit",
+        "emit-sized",
         "report-health",
         "report",
         "ack",
@@ -228,6 +239,12 @@ async fn act(
     let done = match verb {
         "close" => unit.close().await,
         "emit" => unit.emit(&arg("stream"), arg("payload").into_bytes()).await,
+        // A payload of the size asked, byte i being i mod 251, as the suite checks it.
+        "emit-sized" => {
+            let size = d["args"]["bytes"].as_u64().unwrap_or(0) as usize;
+            let payload = (0..size).map(|i| (i % 251) as u8).collect();
+            unit.emit(&arg("stream"), payload).await
+        }
         "report-health" => {
             unit.health(
                 d["args"]["grade"].as_u64().unwrap_or(0).min(255) as u8,

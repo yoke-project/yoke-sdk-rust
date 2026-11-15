@@ -220,11 +220,13 @@ fn station() -> Declaration {
                 id: "station.spectra".into(),
                 tolerates_loss: false,
                 tolerates_reorder: false,
+                max_frame: 0,
             },
             Stream {
                 id: "station.diagnostics".into(),
                 tolerates_loss: true,
                 tolerates_reorder: true,
+                max_frame: 0,
             },
         ],
         commands: vec!["calibrate".into()],
@@ -1206,4 +1208,68 @@ async fn every_family_a_unit_originates_has_an_act() {
             .any(|(_, e)| matches!(e.payload, Some(pb::envelope::Payload::Query(_))))
     });
     assert!(!answered, "the question was answered as well as failed");
+}
+
+// std: yoke-sdk-rust:the-plugin-library.20
+#[tokio::test]
+async fn on_a_stream_socket_emit_writes_each_message_after_its_length() {
+    use pb::control::activate::Transport;
+    use std::io::Read as _;
+    let d = Declaration {
+        id: "com.yoke.station.acquire".into(),
+        streams: vec![
+            Stream {
+                id: "station.raw".into(),
+                tolerates_loss: true,
+                max_frame: 4 << 20,
+                ..Default::default()
+            },
+            Stream {
+                id: "station.plain".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let m = d.manifest();
+    assert!(
+        m.contains("max_frame: 4194304") && m.matches("max_frame").count() == 1,
+        "{m}"
+    );
+    let b = bench(accepted()).await;
+    let path = b.dir.join("framed.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut length = [0u8; 4];
+        conn.read_exact(&mut length).unwrap();
+        let mut body = vec![0u8; u32::from_le_bytes(length) as usize];
+        conn.read_exact(&mut body).unwrap();
+        body
+    });
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    let offered = b.seen(|s| s.registrations[0].transports.clone());
+    for t in [
+        Transport::SharedObject,
+        Transport::OrderedStream,
+        Transport::FramedStream,
+    ] {
+        assert!(offered.contains(&(t as i32)), "offered {offered:?}");
+    }
+    b.send(activate(
+        "c-1",
+        "station.preview",
+        Transport::FramedStream,
+        path.to_str().unwrap(),
+    ))
+    .await;
+    acked(&b, "c-1").await;
+    unit.emit("station.preview", vec![5u8; 600 << 10])
+        .await
+        .unwrap();
+    let body = reader.join().unwrap();
+    assert_eq!(body.len(), 16 + (600 << 10));
+    assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap()), 1);
 }

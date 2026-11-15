@@ -43,6 +43,8 @@ pub struct Stream {
     pub id: String,
     pub tolerates_loss: bool,
     pub tolerates_reorder: bool,
+    /// The largest payload the stream emits, in bytes; zero is the Core's default, 1 MiB.
+    pub max_frame: u64,
 }
 
 /// What an operator may grant, governing exactly one object.
@@ -87,6 +89,9 @@ impl Declaration {
                 }
                 if s.tolerates_reorder {
                     m.push_str("    tolerates_reorder: true\n");
+                }
+                if s.max_frame > 0 {
+                    let _ = writeln!(m, "    max_frame: {}", s.max_frame);
                 }
             }
         }
@@ -284,6 +289,11 @@ enum Transport {
     /// The ring the Core created, written into; the connection is held for the stream's life, since the
     /// Core closing it ends the stream.
     Ring(#[allow(dead_code)] socket2::Socket, crate::ring::Writer),
+    /// A stream socket: each message, an envelope or a frame, after its length as a u32 little-endian.
+    Lengthed {
+        socket: std::os::unix::net::UnixStream,
+        framed: bool,
+    },
 }
 
 /// Reaches the transport an activation names, as the Core created it.
@@ -309,6 +319,13 @@ fn connect(a: &pb::control::Activate) -> Result<Emitting, String> {
             Transport::Framed(socket)
         }
         Ok(pb::control::activate::Transport::SharedObject) => connect_ring(a)?,
+        Ok(
+            t @ (pb::control::activate::Transport::OrderedStream
+            | pb::control::activate::Transport::FramedStream),
+        ) => Transport::Lengthed {
+            socket: std::os::unix::net::UnixStream::connect(&a.address).map_err(unreachable)?,
+            framed: t == pb::control::activate::Transport::FramedStream,
+        },
         _ => {
             return Err(format!(
                 "the transport {} of {} is not one this library reaches",
@@ -442,7 +459,11 @@ pub async fn start_with(
             sdk_line: SDK_LINE.into(),
             declared: Some(d.surface()),
             // This library writes the shared ring, so a stream of it that tolerates loss may be carried there.
-            transports: vec![pb::control::activate::Transport::SharedObject as i32],
+            transports: vec![
+                pb::control::activate::Transport::SharedObject as i32,
+                pb::control::activate::Transport::OrderedStream as i32,
+                pb::control::activate::Transport::FramedStream as i32,
+            ],
             ..Default::default()
         })
         .await?
@@ -827,6 +848,31 @@ impl Unit {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
                 ring.publish(clock, &payload).map_err(std::io::Error::other)
+            }
+            Transport::Lengthed { socket, framed } => {
+                use std::io::Write as _;
+                let message = if *framed {
+                    let clock = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let mut frame = Vec::with_capacity(16 + payload.len());
+                    frame.extend_from_slice(&sequence.to_le_bytes());
+                    frame.extend_from_slice(&clock.to_le_bytes());
+                    frame.extend_from_slice(&payload);
+                    frame
+                } else {
+                    let e = self
+                        .shared
+                        .envelopes
+                        .seal(Payload::Data(pb::Data { sequence, payload }));
+                    prost::Message::encode_to_vec(&e)
+                };
+                // Written whole, after its length.
+                let mut out = Vec::with_capacity(4 + message.len());
+                out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                out.extend_from_slice(&message);
+                socket.write_all(&out)
             }
         };
         if written.is_err() {
