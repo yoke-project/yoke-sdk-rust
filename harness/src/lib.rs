@@ -23,6 +23,23 @@ use yoke_sdk::plugin::{
 /// What the harness declares: one object of every kind, a stream on each transport, each governed by a
 /// capability.
 pub fn declaration() -> Declaration {
+    let mut d = declared();
+    // A stream's largest frame is declared only to a suite that names it: a Core of an earlier release
+    // refuses a Manifest key it does not know.
+    if !std::env::var("CONFORMANCE_FEATURES")
+        .unwrap_or_default()
+        .split(',')
+        .any(|f| f == "max_frame")
+    {
+        d.streams.retain(|s| s.id != "conformance.large");
+        d.capabilities
+            .retain(|c| !matches!(&c.governs, Object::Stream(s) if s == "conformance.large"));
+    }
+    d
+}
+
+/// Everything the harness may declare.
+fn declared() -> Declaration {
     Declaration {
         id: "com.yoke.conformance.rust".into(),
         streams: vec![
