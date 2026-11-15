@@ -302,11 +302,39 @@ async fn act(
                 .await
                 .map(|k| value(plain::acknowledged(&k))),
             "reclaim" => a.reclaim().await.map(|r| value(plain::reclaimed(&r))),
-            "stream-subscribe" => a
-                .subscribe_stream(&text(args, "unit"), &text(args, "stream"))
-                .await
-                .map(|mut d| {
-                    let (delivery, flowing) = (d.id.clone(), d.flowing);
+            "stream-subscribe" => {
+                // The suite may name what the library is to read; otherwise it names everything it reads.
+                let reads: Option<Vec<yoke_sdk::interface::Reads>> =
+                    args.get("reads").and_then(|r| r.as_array()).map(|named| {
+                        named
+                            .iter()
+                            .filter_map(|r| match r.as_str() {
+                                Some("stream_socket") => {
+                                    Some(yoke_sdk::interface::Reads::StreamSocket)
+                                }
+                                Some("shared_object") => {
+                                    Some(yoke_sdk::interface::Reads::SharedObject)
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                let subscribed = match reads {
+                    Some(reads) => {
+                        a.subscribe_stream_reading(
+                            &text(args, "unit"),
+                            &text(args, "stream"),
+                            &reads,
+                        )
+                        .await
+                    }
+                    None => {
+                        a.subscribe_stream(&text(args, "unit"), &text(args, "stream"))
+                            .await
+                    }
+                };
+                subscribed.map(|mut d| {
+                    let (delivery, flowing, arrives) = (d.id.clone(), d.flowing, d.arrives.clone());
                     let (id, lines) = (delivery.clone(), lines.clone());
                     tokio::spawn(async move {
                         loop {
@@ -330,8 +358,9 @@ async fn act(
                             }
                         }
                     });
-                    value(json!({"delivery": delivery, "flowing": flowing}))
-                }),
+                    value(json!({"delivery": delivery, "flowing": flowing, "arrives": arrives}))
+                })
+            }
             _ => unreachable!(),
         }
     })

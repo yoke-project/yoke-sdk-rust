@@ -120,3 +120,120 @@ impl Drop for Writer {
         let _ = unsafe { munmap(self.mem.cast(), self.len) };
     }
 }
+
+/// One frame a reader read from a ring.
+pub(crate) struct Read {
+    pub(crate) sequence: u64,
+    pub(crate) clock: u64,
+    pub(crate) payload: Vec<u8>,
+}
+
+/// One reader of a ring, at its own pace: a client the Core handed the ring for reading alone.
+pub(crate) struct Reader {
+    mem: *mut u8,
+    len: usize,
+    slots: u32,
+    capacity: u32,
+    next: u64,
+}
+
+// The mapping is the reader's alone, read on one thread.
+unsafe impl Send for Reader {}
+
+impl Reader {
+    /// Maps the ring a descriptor names, for reading alone, and reads its geometry from its header.
+    pub(crate) fn open(fd: &OwnedFd) -> Result<Reader, String> {
+        let len = rustix::fs::fstat(fd).map_err(|e| e.to_string())?.st_size as usize;
+        if len < HEADER {
+            return Err(format!("the ring is {len} bytes, shorter than its header"));
+        }
+        let mem = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                fd,
+                0,
+            )
+        }
+        .map_err(|e| e.to_string())? as *mut u8;
+        let word = |at: usize| u32::from_le(unsafe { (mem.add(at) as *const u32).read() });
+        let (slots, capacity) = (word(OFF_SLOTS), word(OFF_CAPACITY));
+        let magic = unsafe { std::slice::from_raw_parts(mem, 8) };
+        if magic != MAGIC
+            || word(8) != VERSION
+            || slots == 0
+            || HEADER as u64 + slots as u64 * (SLOT_HEADER as u64 + capacity as u64) > len as u64
+        {
+            let _ = unsafe { munmap(mem.cast(), len) };
+            return Err("the memory handed is not a ring this library reads".into());
+        }
+        Ok(Reader {
+            mem,
+            len,
+            slots,
+            capacity,
+            next: 1,
+        })
+    }
+
+    /// The next frame the reader can still read, waiting at most the interval for one: a lap by the
+    /// producer, or a slot overwritten while it was copied, is a gap the sequence shows.
+    pub(crate) fn next(&mut self, interval: std::time::Duration) -> Option<Read> {
+        let deadline = std::time::Instant::now() + interval;
+        let (wake, published) = unsafe {
+            (
+                AtomicU32::from_ptr(self.mem.add(OFF_WAKE).cast()),
+                AtomicU64::from_ptr(self.mem.add(OFF_PUBLISHED).cast()),
+            )
+        };
+        loop {
+            let seen = wake.load(Ordering::Acquire);
+            let at_most = published.load(Ordering::Acquire);
+            if at_most < self.next {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                let timeout = rustix::thread::futex::Timespec {
+                    tv_sec: left.as_secs() as i64,
+                    tv_nsec: left.subsec_nanos() as i64,
+                };
+                let _ = futex::wait(wake, futex::Flags::empty(), seen, Some(&timeout));
+                continue;
+            }
+            if at_most >= self.slots as u64 {
+                let oldest = at_most - self.slots as u64 + 1;
+                self.next = self.next.max(oldest);
+            }
+            let n = self.next;
+            self.next += 1;
+            let at = HEADER
+                + ((n - 1) % self.slots as u64) as usize * (SLOT_HEADER + self.capacity as usize);
+            unsafe {
+                let sequence = AtomicU64::from_ptr(self.mem.add(at).cast());
+                let before = sequence.load(Ordering::Acquire);
+                let clock = u64::from_le((self.mem.add(at + 8) as *const u64).read_unaligned());
+                let length = u32::from_le((self.mem.add(at + 16) as *const u32).read_unaligned())
+                    .min(self.capacity) as usize;
+                let payload =
+                    std::slice::from_raw_parts(self.mem.add(at + SLOT_HEADER), length).to_vec();
+                if before != n || sequence.load(Ordering::Acquire) != n {
+                    continue;
+                }
+                return Some(Read {
+                    sequence: n,
+                    clock,
+                    payload,
+                });
+            }
+        }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let _ = unsafe { munmap(self.mem.cast(), self.len) };
+    }
+}
