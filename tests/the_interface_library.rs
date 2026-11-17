@@ -709,3 +709,159 @@ fn a_panel_built_on_the_library_names_nothing_of_the_administrative_contract() {
         }
     }
 }
+
+/// The context switches of this process's threads named `name`, so far.
+fn waits_of(name: &str) -> u64 {
+    let mut total = 0;
+    for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+        let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        if comm.trim() != name {
+            continue;
+        }
+        let status = std::fs::read_to_string(task.path().join("status")).unwrap_or_default();
+        for line in status.lines() {
+            if let Some(n) = line.strip_prefix("voluntary_ctxt_switches:") {
+                total += n.trim().parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+// std: yoke-sdk-rust:the-interface-library.10
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_of_the_ring_waits_on_its_wake_word() {
+    use pb::request::Operation as Op;
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+    use rustix::mm::{MapFlags, ProtFlags, mmap};
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    use rustix::thread::futex;
+    use std::os::fd::AsFd;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    // The ring, as the Core makes it: four slots of 64 bytes, handed on the lifeline at the activation.
+    let (slots, capacity) = (4u32, 64u32);
+    let size = 64 + slots as usize * (32 + capacity as usize);
+    let memory = memfd_create("yoke-test", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&memory, size as u64).unwrap();
+    let mem = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            size,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &memory,
+            0,
+        )
+    }
+    .unwrap() as *mut u8;
+    let ring = unsafe { std::slice::from_raw_parts_mut(mem, size) };
+    ring[..8].copy_from_slice(b"YOKERING");
+    ring[8..12].copy_from_slice(&1u32.to_le_bytes());
+    ring[12..16].copy_from_slice(&slots.to_le_bytes());
+    ring[16..20].copy_from_slice(&capacity.to_le_bytes());
+    let published = unsafe { AtomicU64::from_ptr(mem.add(24).cast()) };
+    let wake = unsafe { AtomicU32::from_ptr(mem.add(32).cast()) };
+
+    let dir = fresh_dir();
+    let lifeline_path = dir.join("00000001.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&lifeline_path).unwrap();
+    let (accepted, conn) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (c, _) = listener.accept().unwrap();
+        let fds = [memory.as_fd()];
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        control.push(SendAncillaryMessage::ScmRights(&fds));
+        sendmsg(
+            &c,
+            &[std::io::IoSlice::new(&[1, 0, 0, 0, 0])],
+            &mut control,
+            SendFlags::NOSIGNAL,
+        )
+        .unwrap();
+        accepted.send(c).unwrap();
+    });
+    let shared = lifeline_path.to_string_lossy().into_owned();
+    let c = core(move |mut a: Attached| {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let _ = a.out.send(Ok(opening("standing", 1, vec![]))).await;
+            while let Some(Seen::Frame(f)) = a.requests.recv().await {
+                if let Some(Op::StreamSubscribe(_)) =
+                    request_of(&f).and_then(|r| r.operation.as_ref())
+                {
+                    let _ = a
+                        .out
+                        .send(Ok(answer(
+                            &f.call,
+                            pb::response::Answer::StreamSubscribe(pb::Delivering {
+                                delivery: "00000001".into(),
+                                arrives: Some(pb::delivering::Arrives::Shared(shared.clone())),
+                                flowing: true,
+                            }),
+                        )))
+                        .await;
+                }
+            }
+        });
+    });
+    let mut attached = within(
+        "the attachment",
+        Attachment::attach(&serve(&c, &dir), Options::new()),
+    )
+    .await
+    .unwrap();
+    let mut delivery = attached
+        .subscribe_stream("acquire", "spectra")
+        .await
+        .unwrap();
+    let conn = conn.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Waiting a second on a ring with nothing in it, the reader's thread wakes almost never.
+    let reading = tokio::spawn(async move {
+        let f = delivery.next().await;
+        (delivery, f)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = waits_of("yoke-ring");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let idle = waits_of("yoke-ring") - before;
+
+    // The producer publishes one frame, and wakes whoever waits on the word.
+    ring[64 + 8..64 + 16].copy_from_slice(&1001u64.to_le_bytes());
+    ring[64 + 16..64 + 20].copy_from_slice(&3u32.to_le_bytes());
+    ring[64 + 32..64 + 35].copy_from_slice(b"one");
+    unsafe { AtomicU64::from_ptr(mem.add(64).cast()) }.store(1, Ordering::Release);
+    published.store(1, Ordering::Release);
+    wake.fetch_add(1, Ordering::AcqRel);
+    let at = std::time::Instant::now();
+    let _ = futex::wake(&wake, futex::Flags::empty(), i32::MAX as u32);
+    let (mut delivery, f) = within("the frame", reading).await.unwrap();
+    let took = at.elapsed();
+    let f = f.unwrap().unwrap();
+
+    // The lifeline closes and the ring is woken, as the Core does at a delivery's end.
+    drop(conn);
+    wake.fetch_add(1, Ordering::AcqRel);
+    let _ = futex::wake(&wake, futex::Flags::empty(), i32::MAX as u32);
+    let ended = within("the delivery's end", delivery.next()).await.unwrap();
+
+    assert!(
+        idle <= 5,
+        "waiting a second on an empty ring, the reader woke {idle} times"
+    );
+    assert_eq!(
+        (f.sequence, f.sent_at, f.payload),
+        (1, 1001, b"one".to_vec())
+    );
+    assert!(
+        took < Duration::from_millis(100),
+        "the frame was read {took:?} after it was published"
+    );
+    assert!(
+        ended.is_none(),
+        "the delivery did not end when its lifeline closed"
+    );
+    attached.close().await;
+}

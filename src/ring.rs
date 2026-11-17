@@ -178,10 +178,12 @@ impl Reader {
         })
     }
 
-    /// The next frame the reader can still read, waiting at most the interval for one: a lap by the
-    /// producer, or a slot overwritten while it was copied, is a gap the sequence shows.
-    pub(crate) fn next(&mut self, interval: std::time::Duration) -> Option<Read> {
-        let deadline = std::time::Instant::now() + interval;
+    /// The next frame the reader can still read, waiting on the ring's word with no bound: a lap by the
+    /// producer, or a slot overwritten while it was copied, is a gap the sequence shows. `None` when the
+    /// word was woken with nothing published — the Core does so after every stop and every end the
+    /// lifeline carries — so that the caller reads its lifeline then.
+    pub(crate) fn next(&mut self) -> Option<Read> {
+        let mut waited = false;
         let (wake, published) = unsafe {
             (
                 AtomicU32::from_ptr(self.mem.add(OFF_WAKE).cast()),
@@ -192,15 +194,12 @@ impl Reader {
             let seen = wake.load(Ordering::Acquire);
             let at_most = published.load(Ordering::Acquire);
             if at_most < self.next {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                if left.is_zero() {
+                if waited {
                     return None;
                 }
-                let timeout = rustix::thread::futex::Timespec {
-                    tv_sec: left.as_secs() as i64,
-                    tv_nsec: left.subsec_nanos() as i64,
-                };
-                let _ = futex::wait(wake, futex::Flags::empty(), seen, Some(&timeout));
+                // Shared, not private: the producer and the Core that wake it are other processes.
+                let _ = futex::wait(wake, futex::Flags::empty(), seen, None);
+                waited = true;
                 continue;
             }
             if at_most >= self.slots as u64 {

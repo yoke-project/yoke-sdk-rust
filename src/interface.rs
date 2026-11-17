@@ -711,7 +711,10 @@ impl Attachment {
                     ))
                 })?;
                 let (tx, rx) = mpsc::unbounded_channel();
-                std::thread::spawn(move || read_the_ring(lifeline, tx));
+                std::thread::Builder::new()
+                    .name("yoke-ring".into())
+                    .spawn(move || read_the_ring(lifeline, tx))
+                    .map_err(|e| Error::Transport(format!("no thread to read the ring on: {e}")))?;
                 Source::Shared(rx)
             }
             Some(pb::delivering::Arrives::Socket(path)) => {
@@ -889,7 +892,10 @@ pub use pb::unit_stream::Reads;
 
 /// Reads a shared delivery: the lifeline brings each activation's ring as a descriptor on one byte and each
 /// stop as a message of length zero, and its closing is the end; between them, the ring is read frame by
-/// frame. It runs on a thread of its own, so a wait on the ring's word blocks nothing asynchronous.
+/// frame. It runs on a thread of its own, so a wait on the ring's word blocks nothing asynchronous. With no
+/// ring the lifeline is waited on; with one, the ring's word is, with no bound, and the lifeline is read
+/// when the word moves with no frame — the Core of 0.16.0 wakes it after every stop and every end the
+/// lifeline carries. Neither is read at an interval.
 fn read_the_ring(
     lifeline: std::os::unix::net::UnixStream,
     tx: mpsc::UnboundedSender<Option<Frame>>,
@@ -897,11 +903,12 @@ fn read_the_ring(
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
     let mut ring: Option<crate::ring::Reader> = None;
     loop {
-        let _ = lifeline.set_read_timeout(Some(Duration::from_millis(if ring.is_some() {
-            20
+        let _ = lifeline.set_read_timeout(None);
+        let flags = if ring.is_some() {
+            RecvFlags::DONTWAIT
         } else {
-            1000
-        })));
+            RecvFlags::empty()
+        };
         let mut head = [0u8; 5];
         let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -909,7 +916,7 @@ fn read_the_ring(
             &lifeline,
             &mut [std::io::IoSliceMut::new(&mut head[..4])],
             &mut control,
-            RecvFlags::empty(),
+            flags,
         ) {
             Ok(r) if r.bytes == 0 => {
                 let _ = tx.send(None);
@@ -967,7 +974,7 @@ fn read_the_ring(
             }
         }
         if let Some(r) = ring.as_mut() {
-            while let Some(f) = r.next(Duration::from_millis(50)) {
+            while let Some(f) = r.next() {
                 let frame = Frame {
                     sequence: f.sequence,
                     sent_at: f.clock,
