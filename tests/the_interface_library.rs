@@ -729,7 +729,7 @@ fn waits_of(name: &str) -> u64 {
 }
 
 // std: yoke-sdk-rust:the-interface-library.10
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_reader_of_the_ring_waits_on_its_wake_word() {
     use pb::request::Operation as Op;
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
