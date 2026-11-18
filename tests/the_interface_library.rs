@@ -345,7 +345,7 @@ async fn a_subscription_is_delivered_in_order_until_ended_and_nothing_reconnects
                     .await;
             }
             let overflow = pb::Subscribed {
-                carries: Some(pb::subscribed::Carries::Overflow(pb::Snapshot {
+                carries: Some(interface::subscribed::Carries::Overflow(pb::Snapshot {
                     at: 9,
                     records: vec![unit_record("acquire")],
                 })),
@@ -363,7 +363,7 @@ async fn a_subscription_is_delivered_in_order_until_ended_and_nothing_reconnects
                         if matches!(r.operation, Some(Op::Subscribe(_))) =>
                     {
                         let snapshot = pb::Subscribed {
-                            carries: Some(pb::subscribed::Carries::Snapshot(
+                            carries: Some(interface::subscribed::Carries::Snapshot(
                                 pb::Snapshot::default(),
                             )),
                         };
@@ -404,7 +404,7 @@ async fn a_subscription_is_delivered_in_order_until_ended_and_nothing_reconnects
             .unwrap()
             .carries
         {
-            Some(pb::subscribed::Carries::Event(e)) => assert_eq!(e.seq, seq),
+            Some(interface::subscribed::Carries::Event(e)) => assert_eq!(e.seq, seq),
             other => panic!("the standing subscription delivered {other:?}"),
         }
     }
@@ -414,13 +414,13 @@ async fn a_subscription_is_delivered_in_order_until_ended_and_nothing_reconnects
         .unwrap()
         .carries
     {
-        Some(pb::subscribed::Carries::Overflow(s)) => assert_eq!(s.at, 9),
+        Some(interface::subscribed::Carries::Overflow(s)) => assert_eq!(s.at, 9),
         other => panic!("the overflow was {other:?}"),
     }
     let mut sub = attached.subscribe(pb::Filter::default()).await.unwrap();
     assert!(matches!(
         sub.next().await.unwrap().unwrap().carries,
-        Some(pb::subscribed::Carries::Snapshot(_))
+        Some(interface::subscribed::Carries::Snapshot(_))
     ));
     for seq in 10..=11 {
         match within("an event", sub.next())
@@ -429,7 +429,7 @@ async fn a_subscription_is_delivered_in_order_until_ended_and_nothing_reconnects
             .unwrap()
             .carries
         {
-            Some(pb::subscribed::Carries::Event(e)) => assert_eq!(e.seq, seq),
+            Some(interface::subscribed::Carries::Event(e)) => assert_eq!(e.seq, seq),
             other => panic!("the subscription delivered {other:?}"),
         }
     }

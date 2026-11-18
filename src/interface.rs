@@ -31,6 +31,10 @@ use crate::base::{self, Error, Refusal, Subject, Suspension};
 
 pub use pb::{Acknowledged, Authenticated, Event, Filter, Reclaimed, Record, Snapshot, Subscribed};
 
+/// What a subscription's message carries — a snapshot, an event, or an overflow's fresh snapshot — named
+/// here so that a client reads it with this library alone.
+pub use pb::subscribed;
+
 /// The version of the interface contract this library covers, stated on every request.
 pub const CONTRACT: u32 = pb::Contract::Version as u32;
 
