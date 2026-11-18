@@ -476,6 +476,21 @@ pub async fn start(d: &Declaration) -> Result<Unit, Error> {
     start_with(d, |k| std::env::var(k).ok()).await
 }
 
+/// Names the process after its executable. The Core starts a unit through the descriptor it took the
+/// executable's digest through, and the kernel names a process after the path executed — `/proc/self/fd/3`,
+/// so `3` in every list of processes and in the journal. The name is the executable's, from the first
+/// argument the Core passes, cut to the kernel's 15 bytes; where it cannot be written, nothing is said.
+fn name_the_process() {
+    let Some(first) = std::env::args_os().next() else {
+        return;
+    };
+    let Some(name) = std::path::Path::new(&first).file_name() else {
+        return;
+    };
+    let name = name.as_encoded_bytes();
+    let _ = std::fs::write("/proc/self/comm", &name[..name.len().min(15)]);
+}
+
 /// Starts a unit from the environment `getenv` reads: bind, register, open the Session. A refusal is
 /// returned with its stage and code, and nothing is tried again.
 pub async fn start_with(
@@ -483,6 +498,7 @@ pub async fn start_with(
     getenv: impl Fn(&str) -> Option<String>,
 ) -> Result<Unit, Error> {
     let env = environment(getenv)?;
+    name_the_process();
     // Bind before registering: registered and unreachable is the one order that is wrong.
     let _ = std::fs::remove_file(&env.bind);
     let socket = UnixListener::bind(&env.bind).map_err(|e| {
