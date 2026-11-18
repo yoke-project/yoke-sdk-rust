@@ -1344,3 +1344,22 @@ fn emit_on_a_stream_the_core_does_not_read_waits_without_holding_a_worker() {
         .recv_timeout(Duration::from_secs(20))
         .expect("the runtime's one thread stopped: emit held it");
 }
+
+// std: yoke-sdk-rust:the-plugin-library.22
+#[tokio::test]
+async fn a_unit_is_named_after_its_executable() {
+    // As the kernel names a unit the Core started through the descriptor.
+    std::fs::write("/proc/self/comm", "3").unwrap();
+    let b = bench(accepted()).await;
+    let _unit = start_with(&station(), b.getenv()).await.unwrap();
+    let first = std::env::args_os().next().unwrap();
+    let name = std::path::Path::new(&first)
+        .file_name()
+        .unwrap()
+        .as_encoded_bytes();
+    let comm = std::fs::read("/proc/self/comm").unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(comm.strip_suffix(b"\n").unwrap_or(&comm)),
+        String::from_utf8_lossy(&name[..name.len().min(15)])
+    );
+}
