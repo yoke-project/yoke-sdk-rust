@@ -1273,3 +1273,74 @@ async fn on_a_stream_socket_emit_writes_each_message_after_its_length() {
     assert_eq!(body.len(), 16 + (600 << 10));
     assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap()), 1);
 }
+
+// std: yoke-sdk-rust:the-plugin-library.21
+#[test]
+fn emit_on_a_stream_the_core_does_not_read_waits_without_holding_a_worker() {
+    use pb::control::activate::Transport;
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let (done, finished) = std::sync::mpsc::channel();
+    // One thread for the whole runtime: an emit that held its worker would stop everything else on it.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let b = bench(accepted()).await;
+            let ordered = b.dir.join("stalled.sock");
+            let listener = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+            listener.bind(&SockAddr::unix(&ordered).unwrap()).unwrap();
+            listener.listen(1).unwrap();
+            // The Core's side accepts and never reads.
+            let held = std::thread::spawn(move || listener.accept().map(|(conn, _)| conn));
+            let unit = start_with(&station(), b.getenv()).await.unwrap();
+            b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+                .await;
+            b.send(activate(
+                "c-1",
+                "station.spectra",
+                Transport::Ordered,
+                &ordered.to_string_lossy(),
+            ))
+            .await;
+            acked(&b, "c-1").await;
+            let _conn = held.join().unwrap().unwrap();
+            let unit = Arc::new(unit);
+            let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let emitter = {
+                let (unit, emitted) = (unit.clone(), emitted.clone());
+                tokio::spawn(async move {
+                    loop {
+                        unit.emit("station.spectra", vec![7u8; 32 << 10])
+                            .await
+                            .unwrap();
+                        emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            };
+            // The buffer fills and the emitter waits; the runtime's one thread goes on.
+            let mut last = u64::MAX;
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let now = emitted.load(std::sync::atomic::Ordering::Relaxed);
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                emitted.load(std::sync::atomic::Ordering::Relaxed),
+                last,
+                "the emitter went on with nobody reading"
+            );
+            assert!(!emitter.is_finished(), "the emitter ended: {last} sent");
+            emitter.abort();
+        });
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the runtime's one thread stopped: emit held it");
+}

@@ -265,3 +265,16 @@
 | **Precondition** | a declaration whose stream `station.raw` declares `max_frame` 4 MiB |
 | **Action** | the Manifest is generated; a unit is started; the Core activates a stream on `TRANSPORT_FRAMED_STREAM`, and emit sends 600 KiB |
 | **Expected** | the Manifest says `max_frame: 4194304` for that stream alone; the registration offers the shared object and both stream transports; the stream socket reads a `u32` little-endian length and then the frame of sequence 1, whole |
+
+## yoke-sdk-rust:the-plugin-library.21 — emit on a stream the Core does not read waits, and holds no worker of the runtime
+
+| Field | Value |
+| --- | --- |
+| **Cites** | arch/50-plugin-surface/07 §What the two tolerances select · arch/50-plugin-surface/07 §What every transport keeps |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | a runtime of one thread; a Core that activates a lossless stream on `TRANSPORT_ORDERED`, accepts the connection and never reads it |
+| **Action** | emit 32 KiB at a time until the transport takes nothing, while the same thread runs a timer |
+| **Expected** | the emitter waits and sends nothing more; the timer goes on firing on the runtime's one thread |
