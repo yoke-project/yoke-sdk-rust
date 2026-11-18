@@ -13,6 +13,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -272,7 +274,7 @@ struct State {
     events: Option<mpsc::UnboundedSender<Event>>,
     ended: bool,
     closing: bool,
-    active: HashMap<String, Arc<Mutex<Emitting>>>,
+    active: HashMap<String, Arc<tokio::sync::Mutex<Emitting>>>,
 }
 
 /// One activated stream: the library's connection to its transport, and the next sequence.
@@ -281,19 +283,56 @@ struct Emitting {
     next: u64,
 }
 
+/// Every transport a write may wait on is non-blocking and awaited, so that a stream the Core reads slowly
+/// holds back its own emitter and never a worker of the runtime.
 enum Transport {
     /// One data envelope per packet.
-    Ordered(socket2::Socket),
+    Ordered(AsyncFd<socket2::Socket>),
     /// One frame per datagram: a little-endian header of sequence and clock, then the payload.
-    Framed(std::os::unix::net::UnixDatagram),
+    Framed(AsyncFd<std::os::unix::net::UnixDatagram>),
     /// The ring the Core created, written into; the connection is held for the stream's life, since the
     /// Core closing it ends the stream.
     Ring(#[allow(dead_code)] socket2::Socket, crate::ring::Writer),
     /// A stream socket: each message, an envelope or a frame, after its length as a u32 little-endian.
     Lengthed {
-        socket: std::os::unix::net::UnixStream,
+        socket: AsyncFd<std::os::unix::net::UnixStream>,
         framed: bool,
     },
+}
+
+/// Registers a connected socket with the runtime, non-blocking.
+fn awaited<T: std::os::fd::AsRawFd>(
+    socket: T,
+    nonblocking: impl FnOnce(&T) -> std::io::Result<()>,
+) -> std::io::Result<AsyncFd<T>> {
+    nonblocking(&socket)?;
+    AsyncFd::with_interest(socket, Interest::WRITABLE)
+}
+
+/// Writes one message whole, waiting while the transport takes nothing. `write` is one attempt and says how
+/// much it took; on a transport that keeps message boundaries (`atomic`), one attempt takes all or fails.
+async fn whole<T: std::os::fd::AsRawFd>(
+    fd: &AsyncFd<T>,
+    message: &[u8],
+    atomic: bool,
+    mut write: impl FnMut(&T, &[u8]) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let mut at = 0;
+    while at < message.len() {
+        let mut ready = fd.writable().await?;
+        match ready.try_io(|inner| write(inner.get_ref(), &message[at..])) {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(n)) if atomic && n < message.len() => {
+                return Err(std::io::Error::other(
+                    "the transport took part of a message",
+                ));
+            }
+            Ok(Ok(n)) => at += n,
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => continue,
+        }
+    }
+    Ok(())
 }
 
 /// Reaches the transport an activation names, as the Core created it.
@@ -311,19 +350,23 @@ fn connect(a: &pb::control::Activate) -> Result<Emitting, String> {
             socket
                 .connect(&SockAddr::unix(&a.address).map_err(unreachable)?)
                 .map_err(unreachable)?;
-            Transport::Ordered(socket)
+            Transport::Ordered(awaited(socket, |s| s.set_nonblocking(true)).map_err(unreachable)?)
         }
         Ok(pb::control::activate::Transport::Framed) => {
             let socket = std::os::unix::net::UnixDatagram::unbound().map_err(unreachable)?;
             socket.connect(&a.address).map_err(unreachable)?;
-            Transport::Framed(socket)
+            Transport::Framed(awaited(socket, |s| s.set_nonblocking(true)).map_err(unreachable)?)
         }
         Ok(pb::control::activate::Transport::SharedObject) => connect_ring(a)?,
         Ok(
             t @ (pb::control::activate::Transport::OrderedStream
             | pb::control::activate::Transport::FramedStream),
         ) => Transport::Lengthed {
-            socket: std::os::unix::net::UnixStream::connect(&a.address).map_err(unreachable)?,
+            socket: awaited(
+                std::os::unix::net::UnixStream::connect(&a.address).map_err(unreachable)?,
+                |s| s.set_nonblocking(true),
+            )
+            .map_err(unreachable)?,
             framed: t == pb::control::activate::Transport::FramedStream,
         },
         _ => {
@@ -612,53 +655,53 @@ async fn receive(
                 });
                 return;
             }
-            Some(Payload::Control(pb::Control { kind: Some(kind) })) => match kind {
-                pb::control::Kind::Command(c) => shared.surface(Event::Command(Command {
-                    id: e.message_id,
-                    r#type: c.r#type,
-                    payload: c.payload,
-                })),
-                pb::control::Kind::Activate(a) => {
-                    let transport = pb::control::activate::Transport::try_from(a.transport)
-                        .map(|t| words(t.as_str_name(), "TRANSPORT_"))
-                        .unwrap_or_default();
-                    match connect(&a) {
-                        Ok(flow) => {
-                            shared
-                                .state
-                                .lock()
-                                .unwrap()
-                                .active
-                                .insert(a.stream.clone(), Arc::new(Mutex::new(flow)));
-                            let _ = shared.answer(
-                                &e.message_id,
-                                acknowledgement(pb::ack::Outcome::Done, String::new()),
-                            );
+            Some(Payload::Control(pb::Control { kind: Some(kind) })) => {
+                match kind {
+                    pb::control::Kind::Command(c) => shared.surface(Event::Command(Command {
+                        id: e.message_id,
+                        r#type: c.r#type,
+                        payload: c.payload,
+                    })),
+                    pb::control::Kind::Activate(a) => {
+                        let transport = pb::control::activate::Transport::try_from(a.transport)
+                            .map(|t| words(t.as_str_name(), "TRANSPORT_"))
+                            .unwrap_or_default();
+                        match connect(&a) {
+                            Ok(flow) => {
+                                shared.state.lock().unwrap().active.insert(
+                                    a.stream.clone(),
+                                    Arc::new(tokio::sync::Mutex::new(flow)),
+                                );
+                                let _ = shared.answer(
+                                    &e.message_id,
+                                    acknowledgement(pb::ack::Outcome::Done, String::new()),
+                                );
+                            }
+                            Err(why) => {
+                                let _ = shared.answer(
+                                    &e.message_id,
+                                    acknowledgement(pb::ack::Outcome::Failed, why),
+                                );
+                                continue;
+                            }
                         }
-                        Err(why) => {
-                            let _ = shared.answer(
-                                &e.message_id,
-                                acknowledgement(pb::ack::Outcome::Failed, why),
-                            );
-                            continue;
-                        }
+                        shared.surface(Event::Activated(Activated {
+                            stream: a.stream,
+                            transport,
+                            address: a.address,
+                        }));
                     }
-                    shared.surface(Event::Activated(Activated {
-                        stream: a.stream,
-                        transport,
-                        address: a.address,
-                    }));
+                    pb::control::Kind::Stop(s) => {
+                        // Dropping the connection closes it.
+                        shared.state.lock().unwrap().active.remove(&s.stream);
+                        let _ = shared.answer(
+                            &e.message_id,
+                            acknowledgement(pb::ack::Outcome::Done, String::new()),
+                        );
+                        shared.surface(Event::Stopped { stream: s.stream });
+                    }
                 }
-                pb::control::Kind::Stop(s) => {
-                    // Dropping the connection closes it.
-                    shared.state.lock().unwrap().active.remove(&s.stream);
-                    let _ = shared.answer(
-                        &e.message_id,
-                        acknowledgement(pb::ack::Outcome::Done, String::new()),
-                    );
-                    shared.surface(Event::Stopped { stream: s.stream });
-                }
-            },
+            }
             Some(Payload::Query(pb::Query {
                 kind: Some(pb::query::Kind::Question(q)),
             })) => shared.surface(Event::Question(Question {
@@ -820,7 +863,7 @@ impl Unit {
                 format!("the stream {stream} has not been activated"),
             ));
         };
-        let mut flow = flow.lock().unwrap();
+        let mut flow = flow.lock().await;
         flow.next += 1;
         let sequence = flow.next;
         let written = match &mut flow.conn {
@@ -829,7 +872,8 @@ impl Unit {
                     .shared
                     .envelopes
                     .seal(Payload::Data(pb::Data { sequence, payload }));
-                socket.send(&prost::Message::encode_to_vec(&e)).map(|_| ())
+                let message = prost::Message::encode_to_vec(&e);
+                whole(socket, &message, true, |s, m| s.send(m)).await
             }
             Transport::Framed(socket) => {
                 let clock = SystemTime::now()
@@ -840,7 +884,7 @@ impl Unit {
                 frame.extend_from_slice(&sequence.to_le_bytes());
                 frame.extend_from_slice(&clock.to_le_bytes());
                 frame.extend_from_slice(&payload);
-                socket.send(&frame).map(|_| ())
+                whole(socket, &frame, true, |s, m| s.send(m)).await
             }
             Transport::Ring(_, ring) => {
                 let clock = SystemTime::now()
@@ -851,7 +895,8 @@ impl Unit {
             }
             Transport::Lengthed { socket, framed } => {
                 use std::io::Write as _;
-                let message = if *framed {
+                let (socket, framed) = (&*socket, *framed);
+                let message = if framed {
                     let clock = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
@@ -872,7 +917,7 @@ impl Unit {
                 let mut out = Vec::with_capacity(4 + message.len());
                 out.extend_from_slice(&(message.len() as u32).to_le_bytes());
                 out.extend_from_slice(&message);
-                socket.write_all(&out)
+                whole(socket, &out, false, |mut s, m| s.write(m)).await
             }
         };
         if written.is_err() {
