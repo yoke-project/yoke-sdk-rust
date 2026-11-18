@@ -278,3 +278,16 @@
 | **Precondition** | a runtime of one thread; a Core that activates a lossless stream on `TRANSPORT_ORDERED`, accepts the connection and never reads it |
 | **Action** | emit 32 KiB at a time until the transport takes nothing, while the same thread runs a timer |
 | **Expected** | the emitter waits and sends nothing more; the timer goes on firing on the runtime's one thread |
+
+## yoke-sdk-rust:the-plugin-library.22 — a unit is named after its executable, not after the descriptor it was started through
+
+| Field | Value |
+| --- | --- |
+| **Cites** | arch/35-units/04 §The plan |
+| **Level** | L1 |
+| **Method** | test |
+| **Not applicable in** | — |
+| **Label** | blocking |
+| **Precondition** | a process the kernel names `3`, as it names a unit the Core started through `/proc/self/fd/3` |
+| **Action** | start a unit |
+| **Expected** | the process's name is its executable's, from its first argument, cut to 15 bytes |
