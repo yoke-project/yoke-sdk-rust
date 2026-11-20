@@ -865,3 +865,191 @@ async fn a_reader_of_the_ring_waits_on_its_wake_word() {
     );
     attached.close().await;
 }
+
+// std: yoke-sdk-rust:the-interface-library.11
+#[tokio::test]
+async fn a_question_names_its_cause() {
+    use pb::request::Operation as Op;
+    let dir = fresh_dir();
+    let c = core(move |mut a: Attached| {
+        tokio::spawn(async move {
+            let _ = a.out.send(Ok(opening("standing", 1, vec![]))).await;
+            while let Some(Seen::Frame(f)) = a.requests.recv().await {
+                if let Some(Op::Query(q)) = request_of(&f).and_then(|r| r.operation.as_ref()) {
+                    let said = if q.cause.is_empty() {
+                        answer(
+                            &f.call,
+                            pb::response::Answer::Query(pb::Answered {
+                                payload: b"plain".to_vec(),
+                            }),
+                        )
+                    } else {
+                        refusal(
+                            &f.call,
+                            pb::Refusal {
+                                code: "use.cause.unknown".into(),
+                                message: "no such question".into(),
+                                detail: Some(pb::refusal::Detail::Item(q.cause.clone())),
+                            },
+                        )
+                    };
+                    let _ = a.out.send(Ok(said)).await;
+                }
+            }
+        });
+    });
+    let attached = within(
+        "the attachment",
+        Attachment::attach(&serve(&c, &dir), Options::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attached.ask("source", "station.status", b"").await.unwrap(),
+        b"plain"
+    );
+    match attached
+        .ask_caused("q-7", "source", "station.status", b"why")
+        .await
+    {
+        Err(yoke_sdk::base::Error::Refusal(r)) => {
+            assert_eq!(r.code, "use.cause.unknown");
+            assert_eq!(r.item.as_deref(), Some("q-7"));
+        }
+        other => panic!("a question naming a cause was answered {other:?}"),
+    }
+    let sent: Vec<pb::Question> = c
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(
+            |(_, f)| match request_of(f).and_then(|r| r.operation.clone()) {
+                Some(Op::Query(q)) => Some(q),
+                _ => None,
+            },
+        )
+        .collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].cause, "");
+    assert_eq!(sent[1].cause, "q-7");
+    assert_eq!(sent[1].payload, b"why");
+}
+
+// std: yoke-sdk-rust:the-interface-library.12
+#[tokio::test]
+async fn a_followed_stream_is_subscribed_again_when_its_delivery_ends() {
+    use pb::request::Operation as Op;
+    let dir = fresh_dir();
+    let refused = Arc::new(Mutex::new(0));
+    let refusals = refused.clone();
+    let c = core(move |mut a: Attached| {
+        let refusals = refusals.clone();
+        tokio::spawn(async move {
+            let _ = a.out.send(Ok(opening("standing", 1, vec![]))).await;
+            let mut subscriptions = 0;
+            while let Some(Seen::Frame(f)) = a.requests.recv().await {
+                match request_of(&f).and_then(|r| r.operation.as_ref()) {
+                    Some(Op::StreamStart(_)) => {
+                        // Between the two lives, the unit is not running: the follow waits it out.
+                        let absent = subscriptions == 1 && *refusals.lock().unwrap() < 2;
+                        let said = if absent {
+                            *refusals.lock().unwrap() += 1;
+                            refusal(
+                                &f.call,
+                                pb::Refusal {
+                                    code: "unit.not_running".into(),
+                                    message: "source is not running".into(),
+                                    detail: Some(pb::refusal::Detail::Subject(pb::Subject {
+                                        kind: "unit".into(),
+                                        identity: "source".into(),
+                                        ..Default::default()
+                                    })),
+                                },
+                            )
+                        } else {
+                            answer(
+                                &f.call,
+                                pb::response::Answer::StreamStart(pb::Acknowledged::default()),
+                            )
+                        };
+                        let _ = a.out.send(Ok(said)).await;
+                    }
+                    Some(Op::StreamSubscribe(_)) => {
+                        subscriptions += 1;
+                        let id = format!("d-{subscriptions}");
+                        let _ = a
+                            .out
+                            .send(Ok(answer(
+                                &f.call,
+                                pb::response::Answer::StreamSubscribe(pb::Delivering {
+                                    delivery: id.clone(),
+                                    arrives: Some(pb::delivering::Arrives::Connection(true)),
+                                    flowing: true,
+                                }),
+                            )))
+                            .await;
+                        let _ = a
+                            .out
+                            .send(Ok(pb::CoreFrame {
+                                call: id.clone(),
+                                carries: Some(pb::core_frame::Carries::Delivery(
+                                    pb::StreamDelivery {
+                                        delivery: id.clone(),
+                                        sequence: 1,
+                                        sent_at: 0,
+                                        payload: format!("life {subscriptions}").into_bytes(),
+                                    },
+                                )),
+                            }))
+                            .await;
+                        if subscriptions == 1 {
+                            // The unit's Session ended: so did the delivery.
+                            let _ = a.out.send(Ok(completion(&id))).await;
+                        }
+                    }
+                    Some(Op::StreamUnsubscribe(_)) => {
+                        let _ = a
+                            .out
+                            .send(Ok(answer(
+                                &f.call,
+                                pb::response::Answer::StreamUnsubscribe(pb::Released {}),
+                            )))
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+    let attached = within(
+        "the attachment",
+        Attachment::attach(&serve(&c, &dir), Options::new()),
+    )
+    .await
+    .unwrap();
+    let mut f = within("the follow", attached.follow("source", "station.processed"))
+        .await
+        .unwrap();
+    for (n, want) in ["life 1", "life 2"].iter().enumerate() {
+        let frame = within("a frame", f.next()).await.unwrap();
+        assert_eq!(frame.payload, want.as_bytes());
+        assert_eq!(frame.sequence, 1);
+        assert_eq!(f.delivery(), format!("d-{}", n + 1));
+    }
+    assert_eq!(*refused.lock().unwrap(), 2);
+    let starts = c
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, f)| {
+            matches!(
+                request_of(f).and_then(|r| r.operation.as_ref()),
+                Some(Op::StreamStart(_))
+            )
+        })
+        .count();
+    assert_eq!(starts, 4);
+    within("the close", f.close()).await.unwrap();
+}

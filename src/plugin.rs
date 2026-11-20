@@ -8,7 +8,7 @@
 //! retries an admission, never polls, never creates a stream's transport and never chooses a severity or
 //! a grade.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,18 @@ pub struct Declaration {
     pub queries: Vec<String>,
     pub occurrences: Vec<String>,
     pub capabilities: Vec<Capability>,
+    /// For each `unit` need, what the Plugin uses of the unit bound to it: questions it asks and streams it
+    /// follows, in that unit's vocabulary. There are no commands: a unit never instructs another.
+    pub uses: BTreeMap<String, Use>,
+    /// The `secret` needs whose value the unit replaces itself, with [`rewrite`].
+    pub rewrites: Vec<String>,
+}
+
+/// What a Plugin uses of one `unit` need.
+#[derive(Debug, Clone, Default)]
+pub struct Use {
+    pub questions: Vec<String>,
+    pub streams: Vec<String>,
 }
 
 /// A stream the Plugin may publish, and what its data tolerates.
@@ -64,6 +76,10 @@ pub enum Object {
     Query(String),
     Occurrence(String),
     Surface(String),
+    /// A question of a `unit` need, named in `uses`: the need, then the query type.
+    UseQuery(String, String),
+    /// A stream of a `unit` need, named in `uses`: the need, then the stream.
+    UseStream(String, String),
 }
 
 impl Declaration {
@@ -109,22 +125,52 @@ impl Declaration {
                 }
             }
         }
+        if !self.uses.is_empty() {
+            m.push_str("uses:\n");
+            for (need, u) in &self.uses {
+                let _ = writeln!(m, "  {}:", scalar(need));
+                for (key, list) in [("questions", &u.questions), ("streams", &u.streams)] {
+                    if !list.is_empty() {
+                        let _ = writeln!(m, "    {key}:");
+                        for id in list {
+                            let _ = writeln!(m, "      - {}", scalar(id));
+                        }
+                    }
+                }
+            }
+        }
+        if !self.rewrites.is_empty() {
+            m.push_str("rewrites:\n");
+            for name in &self.rewrites {
+                let _ = writeln!(m, "  - {}", scalar(name));
+            }
+        }
         if !self.capabilities.is_empty() {
             m.push_str("capabilities:\n");
             for c in &self.capabilities {
+                let _ = writeln!(m, "  - name: {}\n    governs:", scalar(&c.name));
                 let (kind, id) = match &c.governs {
                     Object::Stream(id) => ("stream", id),
                     Object::Command(id) => ("command", id),
                     Object::Query(id) => ("query", id),
                     Object::Occurrence(id) => ("occurrence", id),
                     Object::Surface(id) => ("surface", id),
+                    Object::UseQuery(need, id) | Object::UseStream(need, id) => {
+                        let kind = if matches!(c.governs, Object::UseQuery(..)) {
+                            "query"
+                        } else {
+                            "stream"
+                        };
+                        let _ = writeln!(
+                            m,
+                            "      use:\n        need: {}\n        {kind}: {}",
+                            scalar(need),
+                            scalar(id)
+                        );
+                        continue;
+                    }
                 };
-                let _ = writeln!(
-                    m,
-                    "  - name: {}\n    governs:\n      {kind}: {}",
-                    scalar(&c.name),
-                    scalar(id)
-                );
+                let _ = writeln!(m, "      {kind}: {}", scalar(id));
             }
         }
         m
@@ -199,12 +245,20 @@ pub struct Command {
     pub payload: Vec<u8>,
 }
 
-/// A question the Core asked, to be answered.
+/// A question the Core asked, to be answered. The Core states who asked, the instant the asker stops
+/// waiting and the chain the question belongs to; the unit states none of them. A unit asking on a need's
+/// channel while it answers names `id` as the cause.
 #[derive(Debug, Clone)]
 pub struct Question {
     pub id: String,
     pub r#type: String,
     pub payload: Vec<u8>,
+    /// `unit:<unit>`, `channel:<name>` or `operator:<person>`.
+    pub asker: String,
+    /// The instant the asker stops waiting.
+    pub deadline: SystemTime,
+    /// The chain's identity, 32 lower-case hex digits.
+    pub chain: String,
 }
 
 /// A stream the unit may now emit on, and where.
@@ -724,6 +778,9 @@ async fn receive(
                 id: e.message_id,
                 r#type: q.r#type,
                 payload: q.payload,
+                asker: q.asker,
+                deadline: UNIX_EPOCH + Duration::from_millis(q.deadline),
+                chain: q.chain,
             })),
             Some(Payload::Error(err)) => shared.surface(Event::Refused {
                 correlation: e.correlation_id,
@@ -946,4 +1003,36 @@ impl Unit {
             )
         })
     }
+}
+
+/// Replaces the value of a secret the Plugin declares in `rewrites`, at `path` — the value `${bind.<name>}`
+/// resolved to — without a restart: the new value is written beside it as `value.new`, flushed, and renamed
+/// over it, so a reader meets the old value or the new one and never a part of either. The Core never opens
+/// it; the unit reads it again when it next needs it.
+pub fn rewrite(path: impl AsRef<std::path::Path>, value: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = path.as_ref();
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let next = dir.join("value.new");
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&next)?;
+        f.write_all(value)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&next, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&next);
+        return written;
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }

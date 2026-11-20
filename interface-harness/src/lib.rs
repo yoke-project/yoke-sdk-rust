@@ -125,6 +125,7 @@ fn refused(error: Error) -> Map<String, Value> {
 struct State {
     attached: Vec<Attachment>,
     standing: Option<String>,
+    follows: usize,
 }
 
 /// Runs the harness until it is told to finish, and is its exit status.
@@ -230,6 +231,7 @@ async fn act(
         "stream-start",
         "stream-stop",
         "stream-subscribe",
+        "stream-follow",
         "reclaim",
     ];
     if !known.contains(&verb) {
@@ -237,6 +239,10 @@ async fn act(
         line.insert("unrecognised".into(), json!(true));
         return line;
     }
+    if verb == "stream-follow" {
+        state.follows += 1;
+    }
+    let follows = state.follows;
     let Some(a) = state.attached.first() else {
         return value(json!({"failed": true, "attached": false}));
     };
@@ -286,7 +292,8 @@ async fn act(
                 .await
                 .map(|k| value(plain::acknowledged(&k))),
             "query" => a
-                .ask(
+                .ask_caused(
+                    &text(args, "cause"),
                     &text(args, "unit"),
                     &text(args, "type"),
                     text(args, "payload").as_bytes(),
@@ -359,6 +366,36 @@ async fn act(
                         }
                     });
                     value(json!({"delivery": delivery, "flowing": flowing, "arrives": arrives}))
+                })
+            }
+            // A stream followed across its unit's restarts: each frame names the follow and the delivery it
+            // came on.
+            "stream-follow" => {
+                let followed = a.follow(&text(args, "unit"), &text(args, "stream")).await;
+                followed.map(|mut f| {
+                    let id = format!("follow-{}", follows);
+                    let (named, lines) = (id.clone(), lines.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            match f.next().await {
+                                Ok(frame) => {
+                                    lines
+                                        .observe(
+                                            "frame",
+                                            json!({"follow": named, "delivery": f.delivery(),
+                                                "sequence": frame.sequence, "sent_at": frame.sent_at,
+                                                "payload": String::from_utf8_lossy(&frame.payload)}),
+                                        )
+                                        .await
+                                }
+                                Err(_) => {
+                                    lines.observe("follow-ended", json!({"follow": named})).await;
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                    value(json!({"follow": id}))
                 })
             }
             _ => unreachable!(),
