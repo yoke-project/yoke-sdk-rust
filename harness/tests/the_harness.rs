@@ -96,6 +96,14 @@ impl Drop for Suite {
 async fn started(
     answer: impl Fn(&pb::RegisterRequest) -> pb::RegisterResponse + Send + Sync + 'static,
 ) -> (Suite, Value) {
+    started_with(answer, &[]).await
+}
+
+/// `started`, with more of the environment the suite gives a harness.
+async fn started_with(
+    answer: impl Fn(&pb::RegisterRequest) -> pb::RegisterResponse + Send + Sync + 'static,
+    extra: &[(&str, &str)],
+) -> (Suite, Value) {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ykh-{}-{}",
@@ -126,6 +134,7 @@ async fn started(
         .env("YOKE_SOCKET", dir.join("plugin.sock"))
         .env("YOKE_BIND", dir.join("bind.sock"))
         .env("YOKE_TOKEN", "t")
+        .envs(extra.iter().copied())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -406,6 +415,7 @@ async fn a_question_is_observed_with_its_bytes() {
                 kind: Some(pb::query::Kind::Question(pb::query::Question {
                     r#type: "status".into(),
                     payload: b"how are you".to_vec(),
+                    ..Default::default()
                 })),
             })),
             ..Default::default()
@@ -438,4 +448,68 @@ fn it_declares_a_stream_on_each_transport() {
             "{stream} is governed by no capability"
         );
     }
+}
+
+// std: yoke-sdk-rust:the-harness.11
+#[tokio::test]
+async fn a_question_is_observed_with_who_asked_its_deadline_and_its_chain() {
+    let (mut suite, _) = started(restricted).await;
+    suite.directive("start", json!({})).await;
+    suite
+        .send(pb::Envelope {
+            message_id: "q-1".into(),
+            session_id: "sid-1".into(),
+            payload: Some(pb::envelope::Payload::Query(pb::Query {
+                kind: Some(pb::query::Kind::Question(pb::query::Question {
+                    r#type: "status".into(),
+                    asker: "operator:ada".into(),
+                    deadline: 1794760121000,
+                    chain: "0123456789abcdef0123456789abcdef".into(),
+                    ..Default::default()
+                })),
+            })),
+            ..Default::default()
+        })
+        .await;
+    let observed = suite.read().await;
+    assert_eq!(observed["kind"], "question", "observed {observed}");
+    assert_eq!(observed["fields"]["asker"], "operator:ada");
+    assert_eq!(observed["fields"]["deadline"], 1794760121000u64);
+    assert_eq!(
+        observed["fields"]["chain"],
+        "0123456789abcdef0123456789abcdef"
+    );
+}
+
+// std: yoke-sdk-rust:the-harness.12
+#[tokio::test]
+async fn the_secret_it_rewrites_is_declared_where_the_suite_names_it_and_rewritten() {
+    let plain = yoke_plugin_harness::declaration_for("max_frame");
+    assert!(plain.rewrites.is_empty() && !plain.manifest().contains("rewrites"));
+    let named = yoke_plugin_harness::declaration_for("max_frame,rewrites");
+    assert_eq!(named.rewrites, vec!["token".to_string()]);
+    assert!(named.needs.contains(&"secret:token".to_string()));
+    let dir = std::env::temp_dir().join(format!("ykh-secret-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("token")).unwrap();
+    let path = dir.join("token").join("value");
+    std::fs::write(&path, b"first").unwrap();
+    let secret = path.to_string_lossy().into_owned();
+    let (mut suite, _) = started_with(
+        restricted,
+        &[
+            ("CONFORMANCE_FEATURES", "max_frame,rewrites"),
+            ("CONFORMANCE_SECRET", &secret),
+        ],
+    )
+    .await;
+    suite.directive("start", json!({})).await;
+    let (_, result) = suite
+        .directive("rewrite", json!({"secret": "token", "value": "second"}))
+        .await;
+    assert!(
+        result.get("refusal").is_none() && result["value"]["failed"] != true,
+        "rewrite answered {result}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    let _ = std::fs::remove_dir_all(&dir);
 }

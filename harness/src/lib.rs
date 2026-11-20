@@ -23,14 +23,20 @@ use yoke_sdk::plugin::{
 /// What the harness declares: one object of every kind, a stream on each transport, each governed by a
 /// capability.
 pub fn declaration() -> Declaration {
+    declaration_for(&std::env::var("CONFORMANCE_FEATURES").unwrap_or_default())
+}
+
+/// The declaration for a suite naming `features`, comma-separated: a feature is declared only to a suite
+/// that names it, because a Core of an earlier release refuses a Manifest key it does not know. With
+/// `rewrites`, the harness needs the secret `token` and rewrites it.
+pub fn declaration_for(features: &str) -> Declaration {
     let mut d = declared();
-    // A stream's largest frame is declared only to a suite that names it: a Core of an earlier release
-    // refuses a Manifest key it does not know.
-    if !std::env::var("CONFORMANCE_FEATURES")
-        .unwrap_or_default()
-        .split(',')
-        .any(|f| f == "max_frame")
-    {
+    let named = |feature: &str| features.split(',').any(|f| f == feature);
+    if named("rewrites") {
+        d.needs.push("secret:token".into());
+        d.rewrites = vec!["token".into()];
+    }
+    if !named("max_frame") {
         d.streams.retain(|s| s.id != "conformance.large");
         d.capabilities
             .retain(|c| !matches!(&c.governs, Object::Stream(s) if s == "conformance.large"));
@@ -244,6 +250,7 @@ async fn act(
         "ack",
         "answer",
         "fail",
+        "rewrite",
     ];
     let Some(unit) = state.lock().unwrap().unit.clone() else {
         if known.contains(&verb) {
@@ -300,6 +307,16 @@ async fn act(
             unit.fail(&arg("about"), &arg("code"), &arg("message"))
                 .await
         }
+        // The secret the suite placed, at the path the Core resolved for it.
+        "rewrite" => match getenv("CONFORMANCE_SECRET") {
+            Some(path) if arg("secret") == "token" => {
+                match yoke_sdk::plugin::rewrite(path, arg("value").as_bytes()) {
+                    Ok(()) => Ok(()),
+                    Err(_) => return value(json!({"failed": true})),
+                }
+            }
+            _ => return value(json!({"failed": true})),
+        },
         _ => {
             let mut line = Map::new();
             line.insert("unrecognised".into(), json!(true));
@@ -322,7 +339,13 @@ async fn observe(unit: Arc<Unit>, state: Arc<Mutex<State>>, lines: Lines, ended:
                 ("command", fields)
             }
             Event::Question(q) => {
-                let fields = json!({"id": q.id, "type": q.r#type, "payload": String::from_utf8_lossy(&q.payload)});
+                let deadline = q
+                    .deadline
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                let fields = json!({"id": q.id, "type": q.r#type, "payload": String::from_utf8_lossy(&q.payload),
+                    "asker": q.asker, "deadline": deadline, "chain": q.chain});
                 state.lock().unwrap().questions.insert(q.id.clone(), q);
                 ("question", fields)
             }

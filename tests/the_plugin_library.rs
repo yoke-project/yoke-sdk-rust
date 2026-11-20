@@ -254,6 +254,7 @@ fn station() -> Declaration {
                 governs: Object::Occurrence("calibration.drift".into()),
             },
         ],
+        ..Default::default()
     }
 }
 
@@ -526,6 +527,7 @@ async fn what_the_core_sends_is_surfaced_and_answered_correlated() {
             kind: Some(pb::query::Kind::Question(pb::query::Question {
                 r#type: "head-status".into(),
                 payload: vec![],
+                ..Default::default()
             })),
         })),
         ..Default::default()
@@ -1151,6 +1153,7 @@ async fn every_family_a_unit_originates_has_an_act() {
             kind: Some(pb::query::Kind::Question(pb::query::Question {
                 r#type: "head-status".into(),
                 payload: vec![],
+                ..Default::default()
             })),
         })),
         ..Default::default()
@@ -1362,4 +1365,139 @@ async fn a_unit_is_named_after_its_executable() {
         String::from_utf8_lossy(comm.strip_suffix(b"\n").unwrap_or(&comm)),
         String::from_utf8_lossy(&name[..name.len().min(15)])
     );
+}
+
+// std: yoke-sdk-rust:the-plugin-library.23
+#[test]
+fn a_declaration_says_what_it_uses_and_what_it_rewrites() {
+    let mut uses = std::collections::BTreeMap::new();
+    uses.insert(
+        "accounts".to_string(),
+        yoke_sdk::plugin::Use {
+            questions: vec!["oauth.token".into()],
+            streams: vec!["oauth.status".into()],
+        },
+    );
+    let d = Declaration {
+        id: "com.yoke.calendar".into(),
+        needs: vec!["unit:accounts".into(), "secret:refresh".into()],
+        uses,
+        rewrites: vec!["refresh".into()],
+        capabilities: vec![
+            Capability {
+                name: "query.oauth.token.ask".into(),
+                governs: Object::UseQuery("accounts".into(), "oauth.token".into()),
+            },
+            Capability {
+                name: "stream.oauth.status.follow".into(),
+                governs: Object::UseStream("accounts".into(), "oauth.status".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let want = "\
+manifest: 1
+id: com.yoke.calendar
+protocol: 1
+needs:
+  - unit:accounts
+  - secret:refresh
+uses:
+  accounts:
+    questions:
+      - oauth.token
+    streams:
+      - oauth.status
+rewrites:
+  - refresh
+capabilities:
+  - name: query.oauth.token.ask
+    governs:
+      use:
+        need: accounts
+        query: oauth.token
+  - name: stream.oauth.status.follow
+    governs:
+      use:
+        need: accounts
+        stream: oauth.status
+";
+    assert_eq!(d.manifest(), want);
+    let plain = station().manifest();
+    assert!(
+        !plain.contains("uses:") && !plain.contains("rewrites:") && !plain.contains("use:"),
+        "a declaration with no use generated\n{plain}"
+    );
+}
+
+// std: yoke-sdk-rust:the-plugin-library.24
+#[tokio::test]
+async fn a_question_surfaces_who_asked_its_deadline_and_its_chain() {
+    let b = bench(accepted()).await;
+    let unit = start_with(&station(), b.getenv()).await.unwrap();
+    b.received(|e| matches!(e.payload, Some(pb::envelope::Payload::Session(_))))
+        .await;
+    b.send(pb::Envelope {
+        message_id: "q-1".into(),
+        session_id: "sid-1".into(),
+        payload: Some(pb::envelope::Payload::Query(pb::Query {
+            kind: Some(pb::query::Kind::Question(pb::query::Question {
+                r#type: "head-status".into(),
+                asker: "unit:archive".into(),
+                deadline: 1794760121000,
+                chain: "0123456789abcdef0123456789abcdef".into(),
+                ..Default::default()
+            })),
+        })),
+        ..Default::default()
+    })
+    .await;
+    let q = match tokio::time::timeout(Duration::from_secs(2), unit.next())
+        .await
+        .unwrap()
+    {
+        Some(Event::Question(q)) => q,
+        other => panic!("the unit surfaced {other:?}"),
+    };
+    assert_eq!(q.id, "q-1");
+    assert_eq!(q.asker, "unit:archive");
+    assert_eq!(
+        q.deadline,
+        std::time::UNIX_EPOCH + Duration::from_millis(1794760121000)
+    );
+    assert_eq!(q.chain, "0123456789abcdef0123456789abcdef");
+    unit.answer(&q, b"ok".to_vec()).await.unwrap();
+    let answer = b
+        .received(|e| matches!(e.payload, Some(pb::envelope::Payload::Query(_))))
+        .await;
+    assert_eq!(answer.correlation_id, "q-1");
+}
+
+// std: yoke-sdk-rust:the-plugin-library.25
+#[test]
+fn a_secret_the_unit_rewrites_is_replaced_in_place() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("yk-rewrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let secret = dir.join("refresh");
+    std::fs::create_dir_all(&secret).unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = secret.join("value");
+    std::fs::write(&path, b"old").unwrap();
+    yoke_sdk::plugin::rewrite(&path, b"new").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&secret).unwrap().count(), 1);
+    // A directory the unit may not write leaves the value whole.
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // An account that writes anywhere, as root does, has nothing to show here.
+    if std::fs::File::create(secret.join("probe")).is_err() {
+        assert!(yoke_sdk::plugin::rewrite(&path, b"newer").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -338,3 +338,64 @@ fn the_suite_is_run_against_it_as_against_the_plugin_harness() {
         "the plugin harness is not run beside it"
     );
 }
+
+// std: yoke-sdk-rust:the-interface-harness.06
+#[tokio::test]
+async fn a_query_carries_the_cause_it_is_given_and_a_follow_is_a_verb() {
+    let script: Script = Arc::new(|out, mut incoming| {
+        tokio::spawn(async move {
+            let _ = out.send(Ok(opening(vec![]))).await;
+            while let Some(Ok(f)) = incoming.next().await {
+                let refusal = match &f.carries {
+                    Some(pb::client_frame::Carries::Request(pb::Request {
+                        operation: Some(pb::request::Operation::Query(q)),
+                        ..
+                    })) if !q.cause.is_empty() => pb::Refusal {
+                        code: "use.cause.unknown".into(),
+                        message: "no such question".into(),
+                        detail: Some(pb::refusal::Detail::Item(q.cause.clone())),
+                    },
+                    _ => pb::Refusal {
+                        code: "subject.unknown".into(),
+                        message: "no such unit".into(),
+                        detail: Some(pb::refusal::Detail::Subject(pb::Subject {
+                            kind: "unit".into(),
+                            identity: "nobody".into(),
+                            incarnation: 0,
+                        })),
+                    },
+                };
+                let _ = out
+                    .send(Ok(pb::CoreFrame {
+                        call: f.call,
+                        carries: Some(pb::core_frame::Carries::Refusal(refusal)),
+                    }))
+                    .await;
+            }
+        });
+    });
+    let b = bench(Some(script));
+    let mut h = launch(&b).await;
+    h.next().await;
+    h.direct(1, "attach", json!({"channel": "panel"})).await;
+    let query = h
+        .direct(
+            2,
+            "query",
+            json!({"unit": "source", "type": "status", "cause": "q-none"}),
+        )
+        .await;
+    assert_eq!(query["refusal"], "use.cause.unknown", "{query}");
+    assert_eq!(query["value"]["item"], "q-none");
+    let follow = h
+        .direct(
+            3,
+            "stream-follow",
+            json!({"unit": "nobody", "stream": "station.raw"}),
+        )
+        .await;
+    assert!(follow.get("unrecognised").is_none(), "{follow}");
+    assert_eq!(follow["refusal"], "subject.unknown");
+    h.send(json!({"type": "finish"})).await;
+    h.exit.await.unwrap();
+}

@@ -491,15 +491,14 @@ impl Attachment {
     }
 
     async fn call(&self, op: pb::request::Operation) -> Result<pb::Response, Error> {
-        let (call, mut frames) = self.inner.issue(op).await?;
-        let mut flight = InFlight {
+        self.handle().call(op).await
+    }
+
+    /// What a follow holds of the attachment: its calls, and nothing that ends it.
+    fn handle(&self) -> Handle {
+        Handle {
             inner: self.inner.clone(),
-            call,
-            answered: false,
-        };
-        let answered = first(&mut frames).await;
-        flight.answered = true;
-        answered
+        }
     }
 
     /// Presents an account and its secret, on a channel whose class takes a credential; on one whose
@@ -589,11 +588,26 @@ impl Attachment {
 
     /// Asks a unit a question, its payload opaque, and returns the answer's.
     pub async fn ask(&self, unit: &str, r#type: &str, payload: &[u8]) -> Result<Vec<u8>, Error> {
+        self.ask_caused("", unit, r#type, payload).await
+    }
+
+    /// Asks a unit a question on a need's channel while answering another: `cause` is the identifier of
+    /// the question the asking unit was delivered and is answering, and the Core gives this question that
+    /// one's chain and its deadline less a margin. Only a need's channel takes a cause; any other refuses it
+    /// `use.cause.unknown`.
+    pub async fn ask_caused(
+        &self,
+        cause: &str,
+        unit: &str,
+        r#type: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let resp = self
             .call(pb::request::Operation::Query(pb::Question {
                 unit: unit.into(),
                 r#type: r#type.into(),
                 payload: payload.to_vec(),
+                cause: cause.into(),
             }))
             .await?;
         match resp.answer {
@@ -604,17 +618,7 @@ impl Attachment {
 
     /// Asks for a unit's stream to flow, for everyone.
     pub async fn start_stream(&self, unit: &str, stream: &str) -> Result<pb::Acknowledged, Error> {
-        let resp = self
-            .call(pb::request::Operation::StreamStart(pb::UnitStream {
-                unit: unit.into(),
-                stream: stream.into(),
-                reads: vec![],
-            }))
-            .await?;
-        match resp.answer {
-            Some(pb::response::Answer::StreamStart(a)) => Ok(a),
-            _ => Err(unexpected("stream.start")),
-        }
+        self.handle().start_stream(unit, stream).await
     }
 
     /// Asks for a unit's stream to stop flowing.
@@ -682,6 +686,52 @@ impl Attachment {
     /// `subscribe_stream` naming only the deliveries given; with none, the packet socket every library
     /// reads.
     pub async fn subscribe_stream_reading(
+        &self,
+        unit: &str,
+        stream: &str,
+        reads: &[Reads],
+    ) -> Result<Delivery, Error> {
+        self.handle()
+            .subscribe_stream_reading(unit, stream, reads)
+            .await
+    }
+}
+
+/// The calls of an attachment, shared: what a follow holds, so it can outlive the borrow that made it and
+/// still end when the attachment does.
+#[derive(Clone)]
+struct Handle {
+    inner: Arc<Inner>,
+}
+
+impl Handle {
+    async fn call(&self, op: pb::request::Operation) -> Result<pb::Response, Error> {
+        let (call, mut frames) = self.inner.issue(op).await?;
+        let mut flight = InFlight {
+            inner: self.inner.clone(),
+            call,
+            answered: false,
+        };
+        let answered = first(&mut frames).await;
+        flight.answered = true;
+        answered
+    }
+
+    async fn start_stream(&self, unit: &str, stream: &str) -> Result<pb::Acknowledged, Error> {
+        let resp = self
+            .call(pb::request::Operation::StreamStart(pb::UnitStream {
+                unit: unit.into(),
+                stream: stream.into(),
+                reads: vec![],
+            }))
+            .await?;
+        match resp.answer {
+            Some(pb::response::Answer::StreamStart(a)) => Ok(a),
+            _ => Err(unexpected("stream.start")),
+        }
+    }
+
+    async fn subscribe_stream_reading(
         &self,
         unit: &str,
         stream: &str,
@@ -906,9 +956,12 @@ fn read_the_ring(
 ) {
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
     let mut ring: Option<crate::ring::Reader> = None;
+    // Whether the ring's word moved with nothing published: the Core does so after every stop and every
+    // end, and the lifeline's message is then on its way, so the reader waits for it there.
+    let mut woken = false;
     loop {
         let _ = lifeline.set_read_timeout(None);
-        let flags = if ring.is_some() {
+        let flags = if ring.is_some() && !woken {
             RecvFlags::DONTWAIT
         } else {
             RecvFlags::empty()
@@ -927,6 +980,7 @@ fn read_the_ring(
                 return;
             }
             Ok(r) => {
+                woken = false;
                 let mut handed = None;
                 for message in control.drain() {
                     if let RecvAncillaryMessage::ScmRights(fds) = message {
@@ -988,6 +1042,7 @@ fn read_the_ring(
                     return;
                 }
             }
+            woken = true;
         }
     }
 }
@@ -1099,6 +1154,115 @@ impl Delivery {
         match answered?.answer {
             Some(pb::response::Answer::StreamUnsubscribe(_)) => Ok(()),
             _ => Err(unexpected("stream.unsubscribe")),
+        }
+    }
+}
+
+/// How long a follow waits between two attempts while the unit is not there to subscribe to.
+pub const FOLLOW_RETRY: Duration = Duration::from_millis(250);
+
+/// Whether a refusal says the unit is not there yet — not running, or running with no Session — which a
+/// follow waits out.
+fn returning(error: &Error) -> bool {
+    matches!(error, Error::Refusal(r) if r.code == "unit.not_running" || r.code == "unit.no_session")
+}
+
+/// A unit's stream followed: started and subscribed, and started and subscribed again each time its
+/// delivery ends because the unit's Session did — a restart of the unit, on a need's channel or any other.
+/// Frames come in order within a delivery; the next delivery's numbering is its own.
+pub struct Follow {
+    handle: Handle,
+    unit: String,
+    stream: String,
+    reads: Vec<Reads>,
+    current: Option<Delivery>,
+}
+
+impl Attachment {
+    /// Follows a unit's stream, naming every delivery this library reads. The first subscription is made
+    /// before it returns; a refusal of it other than the unit's absence is returned. The follow holds the
+    /// attachment's calls, not the attachment: it ends when the attachment does.
+    pub async fn follow(&self, unit: &str, stream: &str) -> Result<Follow, Error> {
+        self.follow_reading(unit, stream, &[Reads::StreamSocket, Reads::SharedObject])
+            .await
+    }
+
+    /// `follow` naming only the deliveries given.
+    pub async fn follow_reading(
+        &self,
+        unit: &str,
+        stream: &str,
+        reads: &[Reads],
+    ) -> Result<Follow, Error> {
+        let mut f = Follow {
+            handle: self.handle(),
+            unit: unit.into(),
+            stream: stream.into(),
+            reads: reads.to_vec(),
+            current: None,
+        };
+        f.subscribe().await?;
+        Ok(f)
+    }
+}
+
+impl Follow {
+    /// Starts the stream, where it may, and subscribes to it, until it succeeds, the unit's absence aside.
+    async fn subscribe(&mut self) -> Result<(), Error> {
+        loop {
+            let started = self.handle.start_stream(&self.unit, &self.stream).await;
+            // A start refused for any other reason leaves a stream that may flow anyway: the subscription
+            // says.
+            if !matches!(&started, Err(e) if returning(e)) {
+                match self
+                    .handle
+                    .subscribe_stream_reading(&self.unit, &self.stream, &self.reads)
+                    .await
+                {
+                    Ok(d) => {
+                        self.current = Some(d);
+                        return Ok(());
+                    }
+                    Err(e) if !returning(&e) => return Err(e),
+                    Err(_) => {}
+                }
+            }
+            tokio::time::sleep(FOLLOW_RETRY).await;
+        }
+    }
+
+    /// The identifier of the delivery the last frame came on.
+    pub fn delivery(&self) -> &str {
+        self.current.as_ref().map(|d| d.id.as_str()).unwrap_or("")
+    }
+
+    /// The next frame of the stream, across the unit's restarts; an error that it ended once the attachment
+    /// did, or once the follow was closed.
+    pub async fn next(&mut self) -> Result<Frame, Error> {
+        loop {
+            let Some(d) = self.current.as_mut() else {
+                return Err(ended());
+            };
+            match d.next().await {
+                Ok(Some(frame)) => return Ok(frame),
+                Err(e) if is_ended(&e) => return Err(e),
+                Err(e) if !returning(&e) => return Err(e),
+                _ => {}
+            }
+            // The delivery ended with the unit's Session: what was opened for it is let go, and the stream
+            // followed again.
+            if let Some(d) = self.current.take() {
+                let _ = d.release().await;
+            }
+            self.subscribe().await?;
+        }
+    }
+
+    /// Ends the follow and releases its delivery.
+    pub async fn close(mut self) -> Result<(), Error> {
+        match self.current.take() {
+            Some(d) => d.release().await,
+            None => Ok(()),
         }
     }
 }
