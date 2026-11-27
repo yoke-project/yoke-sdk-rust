@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The checks described by the-plugin-template.std.md, for Rust's template. The tree is generated as the composer generates it:
-# the archive the release verb makes, unpacked, its two values substituted in contents and in names.
+# the archive the release verb makes, unpacked, its two values substituted in contents and in names, and a
+# name's .yoke-template ending taken off.
 
 pt_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -16,6 +17,7 @@ pt_generate() {
   while IFS= read -r -d '' path; do
     local name; name="$(basename "$path")"
     local renamed="${name//@YOKE_ID@/com.example.greeter}"; renamed="${renamed//@YOKE_PROGRAM@/greeter}"
+    [[ -f "$path" ]] && renamed="${renamed%.yoke-template}"
     [[ "$renamed" != "$name" ]] && mv "$path" "$(dirname "$path")/$renamed"
   done < <(find "$dir/template" -depth -print0)
   find "$dir/template" -type f -print0 | xargs -0 sed -i 's/@YOKE_ID@/com.example.greeter/g; s/@YOKE_PROGRAM@/greeter/g'
@@ -24,7 +26,7 @@ pt_generate() {
 # std: yoke-sdk-rust:the-plugin-template.01
 check_the_template_holds_the_plugin_projects_tree() {
   local t="$pt_root/template" missing="" each
-  for each in yoke-plugin.yaml plugin/Cargo.toml plugin/src/main.rs 'plugin/@YOKE_ID@.yaml' try .github/workflows/manifest.yml; do
+  for each in yoke-plugin.yaml plugin/Cargo.toml.yoke-template plugin/src/main.rs 'plugin/@YOKE_ID@.yaml' try .github/workflows/manifest.yml; do
     [[ -e "$t/$each" ]] || missing+=" $each"
   done
   [[ -z "$missing" ]] || { echo "the template has no$missing"; return 1; }
@@ -41,7 +43,7 @@ check_the_template_holds_the_plugin_projects_tree() {
 check_the_template_requires_this_releases_library() {
   local stated required
   stated="$(awk '/^\[workspace.package\]/{w=1; next} /^\[/{w=0} w && $1 == "version" {gsub(/"/, "", $3); print $3}' "$pt_root/Cargo.toml")"
-  required="$(sed -n 's/^yoke-sdk = "=\(.*\)"$/\1/p' "$pt_root/template/plugin/Cargo.toml")"
+  required="$(sed -n 's/^yoke-sdk = "=\(.*\)"$/\1/p' "$pt_root/template/plugin/Cargo.toml.yoke-template")"
   [[ -n "$stated" && "$required" == "$stated" ]] || { echo "the template requires yoke-sdk ${required:-at no exact version} and the workspace states $stated"; return 1; }
 }
 

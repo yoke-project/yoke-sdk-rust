@@ -16,7 +16,7 @@
 | **Label** | blocking |
 | **Precondition** | a clean checkout |
 | **Action** | read `template/` |
-| **Expected** | it holds `yoke-plugin.yaml` naming `language: rust`, `plugin/` with `Cargo.toml`, the program's source and `@YOKE_ID@.yaml`, `try/` with no `yoke.yaml`, and a workflow that builds the program, has it print its Manifest and compares it with the one kept; every `@YOKE_…@` it writes, in contents and in names, is `@YOKE_ID@` or `@YOKE_PROGRAM@` |
+| **Expected** | it holds `yoke-plugin.yaml` naming `language: rust`, `plugin/` with `Cargo.toml.yoke-template`, which the composer writes as `Cargo.toml` and no cargo of this repository reads, the program's source and `@YOKE_ID@.yaml`, `try/` with no `yoke.yaml`, and a workflow that builds the program, has it print its Manifest and compares it with the one kept; every `@YOKE_…@` it writes, in contents and in names, is `@YOKE_ID@` or `@YOKE_PROGRAM@` |
 
 ## yoke-sdk-rust:the-plugin-template.02 — the template requires this release's library
 
@@ -28,7 +28,7 @@
 | **Not applicable in** | — |
 | **Label** | blocking |
 | **Precondition** | a clean checkout |
-| **Action** | read `template/plugin/Cargo.toml` and the version the workspace states |
+| **Action** | read `template/plugin/Cargo.toml.yoke-template` and the version the workspace states |
 | **Expected** | the template requires the crate `yoke-sdk` at exactly the version the workspace states, so that a tag publishes a template of its own library |
 
 ## yoke-sdk-rust:the-plugin-template.03 — generated, the Plugin builds and prints the Manifest it keeps
