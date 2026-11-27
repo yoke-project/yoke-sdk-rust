@@ -42,7 +42,7 @@ impl Lines {
 fn event(e: &pb::Event) -> Value {
     let subject = e.subject.clone().unwrap_or_default();
     json!({"seq": e.seq, "type": e.r#type, "subject_kind": subject.kind,
-        "subject": subject.identity, "severity": e.severity})
+        "subject": subject.identity, "severity": e.severity, "line": e.line})
 }
 
 /// Reports what a subscription delivers, in order, until it ends.
